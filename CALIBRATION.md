@@ -2,9 +2,130 @@
 
 구현 전에 사용자와 Claude가 맞춘 합의 내용이다. 구현은 이 문서를 기준으로 하고, 바뀌면 이 문서를 먼저 고친다.
 
-- 작성일: 2026-10-30
-- 상태: 캘리브레이션 완료, 구현 시작 전
+- 작성일: 2026-10-30, 개정 2026-10-31 (§0)
+- 상태: **v4 스트리밍 서버 구현 (§0)**. §1–§9의 HTTP `POST /asr` 내용 중 §0과 겹치는 것은 §0이 우선한다
 - 반영한 리뷰: Codex 리뷰 + Claude 리뷰 통합본 (항목 번호 #1–#35는 §16 참고)
+
+---
+
+## 0. v4 전환: WebSocket 스트리밍 + 실시간 대화 모드 (2026-10-31)
+
+기획 v4의 `design/ml-server-protocol.md` v1.0(HTTP → WebSocket)과 팀 요청("문장이 다 안 끝나도 인식한 단어가 화면에 쭉 나오는 실시간 대화")을 반영했다. **모델 가중치는 바꾸지 않았다.** 바뀐 것은 실행 방식(fp16, 배치)과 서빙 코드다.
+
+### 0.1 바뀐 것
+| 항목 | 이전 (§1–§9) | 지금 | 근거 |
+|---|---|---|---|
+| 통신 | HTTP `POST /asr`, WAV 업로드 → JSON 1회 | WebSocket `/asr-stream` + `GET /healthz`, `GET /livez` | 프로토콜 v1.0 |
+| 세션 모드 | — | `utterance`(기본, v4 그대로: final 1회) / `conversation`(실시간 대화: 쉼마다 구간 final, 세션 유지) | 실시간 대화 요청 |
+| 모델 | 구음장애 whisper-small | **그대로**. v4 문서의 faster-whisper large-v3-turbo는 채택하지 않음 (팀 확인 필요) | 구음장애 특화 유지 |
+| 정밀도 | fp32 | **fp16** (`ML_DTYPE=fp32`로 되돌릴 수 있음) | 조각 60개 전사가 fp32 노트북과 60/60 같음. 4건 묶음 GPU 702ms → 248ms |
+| GPU 처리 | 한 번에 1건 | 작업자 1개, **최대 4건 묶음(batch)**. final이 interim보다 먼저. interim은 세션당 대기 1개만 (새 것이 오면 바꿔 끼움) | GPU가 밀리면 interim 간격이 저절로 늘고 대기열이 쌓이지 않는다 |
+| 워밍업 | 안 함 (#34) | 시작 시 batch 1–4로 한 번씩 (약 1.5초), 끝나야 `/healthz` 200 | 첫 추론 856ms. interim 목표 300ms |
+| `no_speech_prob` | 뺌 (#16) | final에 넣음 (프로토콜 필수). `<|startoftranscript|>` 다음 자리의 `<|nocaptions|>` 확률 (openai/whisper 정의). VAD가 말소리를 못 찾아 Whisper를 건너뛰면 1.0 | 프로토콜 v1.0 |
+| 무음 판정 | VAD만 | VAD + `no_speech_prob > 0.6`이면 빈 전사 | §0.5 환각 실측 |
+| 길이 | 업로드 20초 | `utterance` 10초 (넘으면 `AUDIO_TOO_LONG` + 자동 final). `conversation` 구간 최대 6초, 세션 600초 | 프로토콜 v1.0, §0.5 |
+| 입력 | WAV 파일 | raw PCM16 little-endian 모노, 8–48kHz (16kHz 권장), 100ms 프레임. **Opus는 받지 않음** (`INVALID_FORMAT`) | 프로토콜 열린 질문 1 → PCM16 제안 |
+| Mock 서버 | 백엔드 담당 | ML이 제공: `scripts/mock_asr_server.py` (포트 9001, 아래 추가 필드 포함) | 프로토콜 §8 |
+| 에러 | HTTP 상태 + `error_code` | `{"type":"error","code",...}`. 세션 하나의 형식 오류는 연결을 닫지 않음 (§0.6) | 프로토콜 §9 |
+
+### 0.2 메시지 (프로토콜 v1.0 + 추가 필드)
+v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 클라이언트도 그대로 동작한다.
+
+| 메시지 | 추가 필드 | 의미 |
+|---|---|---|
+| `start` | `mode` (선택) | `"utterance"`(기본) 또는 `"conversation"` |
+| `transcript_interim` | `segment_id` | 구간 번호 (utterance는 항상 0) |
+| | `stable_text` | 확정된 앞부분. 화면에서 바뀌지 않는다 (진하게 표시) |
+| | `unstable_text` | 아직 바뀔 수 있는 뒷부분 (흐리게 표시) |
+| | `audio_end_ms` | 세션 시작 기준, 이 전사가 반영한 음성의 끝 위치. 지연 측정용 |
+| `transcript_final` | `segment_id` | 어느 구간의 final인지. 같은 `segment_id`의 interim을 이 text로 바꾼다 |
+| | `is_last` | 세션의 마지막 final인지. utterance는 항상 `true` |
+
+- `text`는 `stable_text + " " + unstable_text`. v1.0의 "뒤 interim이 앞 interim을 교체" 규칙 그대로 쓸 수 있다
+- `conversation`: 쉼(800ms)이나 구간 최대 길이에서 구간 final(`is_last: false`)이 온다. `end`를 받으면 남은 구간을 닫고 `is_last: true` final을 보낸다 (남은 말소리가 없으면 `text: ""`)
+- 응답 순서 보장: 한 세션 안에서 final은 `segment_id` 순서대로 온다. 구간 final 뒤에 그 구간의 interim은 오지 않는다
+
+### 0.3 interim 규칙
+- 구간 안 말소리가 300ms 이상 쌓인 뒤부터, 새 말소리가 있을 때만 500ms마다 그 구간 전체를 다시 전사한다 (Whisper는 스트리밍 모델이 아니다)
+- 보내는 간격은 최소 300ms (프로토콜 §7.1). GPU가 밀렸다 풀려도 몰려 나가지 않는다 (부하 시험 최소 간격 408ms)
+- **확정 규칙 (LocalAgreement-2):** 연속한 두 interim이 같게 낸 앞 단어만 확정한다. 확정분은 늘기만 한다. 현재 가설의 마지막 단어는 확정하지 않는다 ("화장" → "화장실에")
+- final은 구간 전체를 다시 전사한 결과라 드물게 확정분과 다를 수 있다. 화면은 final로 바꾼다
+- 구간 나누기(`conversation`): Silero VAD, 세션마다 따로. 말소리가 150ms 미만이면 잡음으로 버린다. 6초에 닿으면 마지막 5초 안의 가장 늦은 쉼에서 자르고 나머지는 다음 구간으로 넘긴다
+
+### 0.4 설정 (환경변수, `server/config.py`)
+| 변수 | 기본값 | 의미 |
+|---|---|---|
+| `ML_MODEL_DIR` | `models/ASR_Whisper_Disease_General` | 모델 경로 |
+| `ML_DTYPE` | `fp16` | `fp16` / `fp32` |
+| `ML_BATCH_MAX` | 4 | GPU 한 번에 묶는 최대 건수 |
+| `ML_INTERIM_STEP_MS` / `ML_MIN_INTERIM_SPEECH_MS` | 500 / 300 | interim 간격 / 첫 interim까지 필요한 말소리 |
+| `ML_VAD_THRESHOLD`, `ML_SPEECH_PAD_MS`, `ML_MIN_SPEECH_MS` | 0.5, 200, 150 | §6 값 그대로 |
+| `ML_END_SILENCE_MS` | 800 | 대화 모드에서 구간을 닫는 쉼 |
+| `ML_UTTERANCE_MAX_S` / `ML_MAX_SEGMENT_S` / `ML_SESSION_MAX_S` | 10 / 6 / 600 | 길이 상한 |
+| `ML_INTERIM_MAX_NEW_TOKENS` / `ML_FINAL_MAX_NEW_TOKENS` | 96 / 128 | 생성 토큰 상한 |
+| `ML_NO_SPEECH_THRESHOLD` / `ML_LOGPROB_THRESHOLD` | 0.6 / 0.0 | 무음 판정 (0.0 = logprob 조건 끔) |
+| `ML_DEBUG_SAVE` | 0 | 1이면 `/tmp/asr-debug/{trace_id}.wav`, 30분 뒤 삭제. 심사장에서는 반드시 0 |
+
+실행: `uvicorn server.app:app --host 0.0.0.0 --port 8001 --workers 1` (워커 1개 고정, §8). 배포 전 보안그룹 조건(§3)은 그대로다.
+
+### 0.5 실측 (2026-10-31, L4, GPU 서버 localhost)
+지연은 "클라이언트가 그 음성의 마지막 100ms 프레임을 보낸 시각 → 메시지 수신"이다. 앱 녹음과 네트워크는 빠져 있다. 오디오는 실제 속도로 보냈다.
+
+**엔진 (`scripts/verify_engine.py`, 조각 60개)**
+| 항목 | fp32 | fp16 |
+|---|---|---|
+| 노트북 호출과 전사 일치 | 60/60 | 60/60 (fp32 노트북 기준) |
+| batch 4 vs batch 1 일치 | 60/60 | 60/60 (confidence 차이 최대 0.0009) |
+| GPU 시간 batch 1 (1건) | 233ms | 133ms |
+| GPU 시간 batch 4 (4건 묶음) | 702ms | 248ms |
+| GPU 메모리 최대 | 2,055MiB | 1,988MiB |
+
+인코더를 한 번만 돌려 `no_speech_prob`과 `generate(encoder_outputs=...)`가 같이 쓰는 방식이 노트북과 같은 결과를 내는 것도 위 60/60으로 확인했다.
+
+**환각 (이 모델의 특성, 중요)**
+| 입력 | 결과 | `no_speech_prob` | confidence |
+|---|---|---|---|
+| 무음 1초, 3초 | "아침 식사 시간은 몇 시까지예요" | 0.69 | 0.73 |
+| 백색잡음 1초 (-40 / -26dBFS) | "땅콩" / "떡" | 0.0002 / 0.0001 | 0.61 / 0.43 |
+| 말소리 앞 0.5초 | "땅콩" | 0.002 | 0.61 |
+| 말소리 조각 60개 | 정상 | 최대 0.0000 | — |
+
+- 무음에서 확신 있게 문장을 지어낸다. openai/whisper 규칙(`no_speech > 0.6` **그리고** `avg_logprob < -1`)으로는 못 거른다 → `no_speech > 0.6`만으로 거른다
+- 잡음과 아주 짧은 말소리는 `no_speech_prob`로 못 거른다. VAD(말소리 없으면 Whisper 생략), 첫 interim 전 말소리 300ms, 확정 규칙(두 번 연속 같아야 확정)으로 줄인다. **unstable 부분에는 지어낸 말이 잠깐 보일 수 있다**
+- confidence는 지어낸 말에도 0.4–0.7이 나온다. 백엔드의 0.3(interim)·0.4(final) 기준으로는 거의 안 걸린다
+
+**스트리밍 (`scripts/stream_client.py`)**
+| 시험 | interim 지연 p50 / p95 / 최대 | 마지막 final 지연 (end 후) p50 / p95 | 에러 |
+|---|---|---|---|
+| utterance, 조각 20개, 동시 4 × 5회 (2회) | 123–157 / 283–380 / 311–408ms (55건씩) | 119–148 / 210–269ms | 0 |
+| conversation, `sample.wav` 실제 발화 90초 × 동시 4 | 117 / 132 / 187ms (80건) | — | 0 |
+| conversation, 쉼 없이 이어 붙인 말 60초 × 동시 4, 구간 최대 10초 | 561 / 851 / 986ms (384건) | 645 / 789ms | 0 |
+| 같은 조건, 구간 최대 6초 (3회) | 312–335 / 543–606 / 706–1010ms | 272–336 / 380–407ms | 0 |
+
+- 프로토콜 SLO(interim p50 ≤ 300, p95 ≤ 500, final p95 ≤ 800ms): **utterance와 실제 발화 대화는 통과**. 쉼 없이 말하는 4명 동시는 interim이 약간 넘는다. 구음장애 발화는 문장 사이 쉼이 길어서(이 샘플은 약 10초) 실제로는 드물다
+- 쉼 없이 말할 때 서버 쪽 내역 (구간 10초): GPU 대기 p50 152 / p95 387ms, GPU 1회 p50 239 / p95 404ms, 평균 2.1건 묶음
+- 대화 모드 `sample.wav` 45초: 문장마다 구간 final 1개 ("문 열어", "문 열어", "나무가 많아"), 마지막은 빈 final
+
+### 0.6 프로토콜과 다르게 한 것, 백엔드에 알릴 점
+1. **세션마다 WebSocket 연결을 따로 열기를 권장한다.** 프로토콜 §5.1.2는 바이너리 프레임을 "가장 최근 `start`의 세션"에 넣는다. 연결 하나에 두 세션이 겹치면 앞 세션의 오디오가 뒤 세션으로 들어간다. 서버는 둘 다 지원하고 규칙도 프로토콜 그대로지만, 겹치지 않게 하는 것은 백엔드 몫이다
+2. **세션 형식 오류(`INVALID_FORMAT`)는 `close(4001)` 대신 error 메시지만 보낸다.** 연결을 같이 쓰는 다른 환자 세션이 끊기지 않게 하려는 것이다. 모델이 준비되지 않았을 때 연결하면 프로토콜대로 error 후 `close(1013)`
+3. `NO_SESSION`: `start` 없이 온 오디오는 `start` 사이에 한 번만 알린다. `AUDIO_TOO_LONG`으로 자동 종료된 뒤 이어 오는 프레임과 늦은 `end`는 조용히 버린다
+4. `trace_id`: 영문·숫자·`-`·`_` 1–64자 (UUIDv4 OK). 아니면 `INVALID_FORMAT`
+5. Opus는 받지 않는다. PCM16 16kHz로 보내 달라
+6. `/livez`(프로세스 생존)를 추가했다. 준비 여부는 `/healthz` 200으로 판단
+7. `/healthz` 200 본문에 `sessions`, `gpu_pending`을 더 넣었다
+8. 로그: JSON 한 줄씩 stdout. 이벤트 `start`, `transcript_interim`, `transcript_final`, `session_closed`, `error`. 공통 필드(§13.1) + `queue_ms`, `gpu_ms`, `batch`, `segment_id`, `interim_index`, `audio_bytes_total`, `interim_count`, `vad_segments`
+
+### 0.7 남은 일
+- ~~`0.0.0.0` 바인딩 + 접근 제한 + systemd 등록~~ **완료 (2026-10-31).** `deploy/`
+  - `marieum-ml.service`: `0.0.0.0:8001`, 죽으면 재시작, 부팅 시 시작
+  - `marieum-ml-firewall.service`: GPU 서버 iptables로 8001은 localhost와 백엔드 서버(`inno-server-006`, `10.1.1.11`)만 허용. ACG는 8001을 막지 않는다 (SSL VPN에서 온 요청이 GPU 서버까지 와서 iptables에 막힘)
+  - 확인: 백엔드 서버 `curl http://10.1.2.11:8001/healthz` → 200, SSL VPN(Mac) → 연결 안 됨
+- 백엔드 서버에서 지연 다시 재기
+- 앱 마이크 음성(실제 경로)으로 시험. 지금은 AI Hub 샘플만
+- 정답 라벨로 CER (라벨 JSON 필요)
+- 앱: `stable_text`/`unstable_text` 표시, `segment_id`별로 final 교체
+- 팀 확인: 모델(구음장애 small 유지 vs large-v3-turbo), 세션당 연결, Opus 미지원, 대화 모드 길이 상한
 
 ---
 
@@ -64,10 +185,20 @@ Hugging Face에 공개된 구음장애 특화 Whisper 모델을 L4 GPU 서버에
 | 서버 주소 | TBD (저녁 미팅). CPU 서버와 같은 VPC면 사설 IP(`hostname -I`), 아니면 공인 IP(`curl ifconfig.me`). 구현에는 영향 없음, `HANDOFF.md`에만 기입 |
 
 ### 환경 확인 체크리스트 (사용자 실행)
-- [ ] GPU 서버 SSH 접속, `nvidia-smi`에서 L4 확인
-- [ ] `df -h .`로 디스크 가용 공간 기록 (모델 약 0.97GB + PyTorch 수 GB)
-- [ ] Python 3.10 또는 3.11, venv 설정
-- [ ] `nvidia-smi`의 CUDA 버전에 맞는 PyTorch 설치, `torch.cuda.is_available() == True` 확인
+- [x] GPU 서버 SSH 접속, `nvidia-smi`에서 L4 확인
+- [x] `df -h .`로 디스크 가용 공간 기록 (모델 약 0.97GB + PyTorch 수 GB)
+- [x] Python 3.10 또는 3.11, venv 설정
+- [x] `nvidia-smi`의 CUDA 버전에 맞는 PyTorch 설치, `torch.cuda.is_available() == True` 확인
+
+### 환경 확인 결과 (2026-10-30)
+| 항목 | 값 |
+|---|---|
+| 호스트 | `inno-gpu-006` (NCP, 사설 IP `10.1.2.11`, SSL VPN 경유 접속) |
+| OS | Ubuntu 24.04.1 LTS |
+| GPU / 드라이버 | NVIDIA L4 23,034MiB / 580.159.04 (CUDA 13.0까지 지원) |
+| CPU / 메모리 / 디스크 | 4코어 / 47GiB (스왑 없음) / 78GB 여유 |
+| Python | 시스템은 3.12.3뿐 → uv 0.13.6으로 CPython 3.11.18 설치, venv `~/marieum-ml/.venv` |
+| PyTorch | torch 2.11.0+cu128, torchaudio 2.11.0+cu128, `cuda.is_available() == True` |
 
 ---
 
@@ -107,11 +238,32 @@ text = processor.batch_decode(out.sequences, skip_special_tokens=True)[0]
 - 임시값 128
 - 정답 라벨 문장을 토크나이저로 세어 최대 토큰 수를 구하고, 그 1.5배 정도로 다시 정한다 (한국어는 글자 하나가 토큰 1–3개)
 - 정상 발화의 결과는 바뀌지 않고, 반복 생성만 끊는다
+- **재검토 필요 (2026-10-30 실측):** 라벨 문장 하나는 끝 토큰 포함 4–8토큰이라, 위 규칙대로면 상한이 약 12가 된다. 하지만 업로드는 최대 20초이고 18.7초 꽉 찬 발화에서 44토큰이 나왔다. 문장 단위 상한으로 정하면 긴 정상 녹음이 잘린다 → **라벨 기준이 아니라 "20초 꽉 찬 발화" 기준으로 정하는 것을 제안**. 128은 44의 약 2.9배라 현재 임시값을 유지해도 된다. 확정은 사용자 합의 후
 
 ### 버전 고정과 디코딩 설정 (#15, #31)
 - transformers, torch, torchaudio 버전을 고정하고 기록한다. 노트북의 `forced_decoder_ids`가 동작하는 버전으로 고르고 스모크 테스트로 확인한다
 - 노트북은 디코딩 설정을 따로 주지 않았다 → 모델의 `generation_config.json` 기본값을 따른다. 그 값(`num_beams`, `do_sample` 등)을 확인해 기록하고, 같은 값으로 명시한다
 - 배포 기록에 모델 revision(커밋 해시), 가중치 checksum, 라이브러리 버전을 남긴다
+
+### 스모크 테스트 결과 (2026-10-30, `scripts/smoke_test.py`)
+| 항목 | 값 |
+|---|---|
+| 모델 revision | `304fe2952840b5b96ca3d4399a43d024912d4096`, `~/marieum-ml/models/ASR_Whisper_Disease_General` (`runs/`, `training_args.bin` 제외) |
+| 가중치 checksum | `model.safetensors` sha256 `8cff1f598ab8d0711cfcd2ad2c602ccf95ed9c1232a1898e5e6cbc7ca131d236` (HF LFS 값과 일치) |
+| 고정 버전 | Python 3.11.18, torch 2.11.0+cu128, torchaudio 2.11.0+cu128, transformers 4.53.3, tokenizers 0.21.4, huggingface_hub 0.36.2, numpy 2.4.6 |
+| 버전 선택 근거 | 모델 `config.json`의 `transformers_version`이 4.53.0.dev0 → 4.53.x 고정. `forced_decoder_ids`는 deprecated 경고만 나고 동작함 |
+| 디코딩 기본값 (#15) | `num_beams=1`, `do_sample=false`, `temperature=1.0`, `max_length=448`, `repetition_penalty=1.0`, `no_repeat_ngram_size=0`, `return_timestamps=false` → greedy. 서버에서 같은 값을 명시한다 |
+| 노트북 호출 vs 서버 호출 | 두 조각 모두 전사가 같음 (`"문 열어"`) |
+| `scores` 정렬 (#14) | `scores`에는 **생성한 토큰만** 들어가고 강제 토큰 4개(`<\|startoftranscript\|> <\|ko\|> <\|transcribe\|> <\|notimestamps\|>`)는 빠진다. `sequences[-len(scores):]`와 `argmax(scores)`가 일치. 끝의 `<\|endoftext\|>`는 특수 토큰이라 confidence에서 뺀다 |
+| `confidence` | 0.9962, 0.9948 (텍스트 토큰 3개). 이 조각에서는 후처리 전 logits와 값이 같았다 |
+| GPU 메모리 | 로딩 후 923MiB, 최대 1,159MiB |
+| 시간 (참고) | 2.7초 조각, 생성 토큰 4개: `feat` 5–11ms, `gen` 약 200ms. 10초 발화는 토큰이 많아 `gen`이 더 길어진다 → §9 625ms 예산 실측 필요 |
+
+주의:
+- 모델 `config.json`의 `forced_decoder_ids`는 `<|en|>`(50259)이다. **반드시 `language="ko"`로 만든 `forced_decoder_ids`를 넘긴다** (노트북과 같음)
+- torchaudio 2.9+의 `torchaudio.load`는 torchcodec이 필요하다. 서버는 WAV를 표준 라이브러리 `wave`로 읽고 `torchaudio.functional.resample`만 쓴다
+- `output_scores`/`output_logits`에 "not valid" 경고가 뜨지만 값은 정상으로 돌아온다
+- 스모크 테스트 조각은 `sample.wav` 9.55–12.25초, 21.15–23.75초를 16kHz로 변환한 것. 원본 44.1kHz → `torchaudio.functional.resample` 경로는 §10 조각 전사에서 확인함
 
 ### 학습 데이터 (#10 조사)
 AI Hub 구음장애 음성인식 데이터(608) 구성과 논문 사용 범위:
@@ -306,6 +458,20 @@ AI Hub 구음장애 음성인식 데이터(608) 구성과 논문 사용 범위:
 - L4 fp32에서 1건당 GPU 점유 시간(`feat` + `gen`)과 생성 토큰 수를 실측한다
 - 못 맞추면 결과를 공유하고 fp16 전환, `max_new_tokens`, 통과 기준을 다시 합의한다
 
+#### 1차 실측 (2026-10-30, L4 fp32, 단독 실행, HTTP 없음)
+| 입력 | 생성 토큰 | `feat` | `gen` |
+|---|---|---|---|
+| 짧은 조각 60개 (3–5초 파일) | 4–8 | 중앙값 4.3ms | 중앙값 202ms, 최대 222ms |
+| 말소리 이어 붙임 9.4초 | 23 | 4.7ms | 358ms (3회 357–359ms) |
+| 말소리 이어 붙임 18.7초 | 44 | 4.9ms | 552ms (3회 551–554ms) |
+| 프로세스 첫 요청 | 4 | 9.5ms | 774ms (통계 제외) |
+
+- 대략 `gen` ≈ 약 150ms(인코더, 길이 무관) + 토큰당 약 9.5ms
+- 10초 꽉 찬 발화 기준 1건 약 363ms → **625ms 예산 안**. 동시 4건이면 GPU 약 1.45초
+- 주의: "꽉 찬 발화"는 이 화자의 느린 발화를 0.3초 간격으로 이어 붙인 것이라 초당 약 2.4토큰이다. 말이 빠르면 토큰이 늘어난다. 최악의 경우(128토큰)는 약 1.37초로 예산을 넘는다
+- 워밍업을 하지 않으므로(#34) 재시작 후 첫 요청은 약 0.8초 걸린다. 2.5초 마감 안이다
+- HTTP, VAD, 대기열을 포함한 왕복 시간은 서버 구현 후 §9 조건으로 다시 잰다
+
 ### 통과 기준 (#23)
 > 10초 음성 4건 동시 × 20회 = **80건**이 모두 200이고 응답이 완전하며, 5xx 0건, 각 왕복 시간(CPU 서버 측정) 3초 미만
 
@@ -346,6 +512,25 @@ AI Hub 구음장애 음성인식 데이터(608) 구성과 논문 사용 범위:
   - 비교 전 학습과 같은 규칙으로 문장부호(`+ * ( ) ? ! , . ~ - '`)와 공백 제거
 - **점수 분포:** 60개 발화의 `confidence` 분포를 기록해 백엔드 기준값 정하는 데 쓴다
 - **한계:** 조용한 방 녹음이라 실제 병실보다 깨끗하다. 화자 1명이다
+
+### 조각 전사 결과 (2026-10-30, `scripts/slice_sample.py`, `scripts/run_chunks.py`)
+서버 VAD 없이, 앞뒤 무음 1초가 붙은 44.1kHz 조각을 서버와 같은 옵션으로 전사했다.
+
+| 항목 | 값 |
+|---|---|
+| 자르기 | 에너지 기준(잡음 바닥 −82dBFS + 15dB), 3초 이상 무음에서 자름 → **정확히 60조각** |
+| 말소리 길이 | 0.72–3.14초 (중앙값 1.27초), 발화 간격 10.2–11.4초 |
+| 전사 | 60개 모두 `<\|endoftext\|>`로 정상 종료, 빈 전사 0 |
+| 평서문·의문문 짝 | 조각 (1,2), (3,4), … 30쌍 모두 전사 일치 → 과분할·누락으로 짝이 밀리지 않았다는 간접 근거 |
+| `confidence` | 최소 0.910, p10 0.996, 중앙값 0.9996. 낮은 건 "전화 왔었어요" 한 쌍(0.948, 0.910)뿐 |
+| 생성 토큰 | 조각당 4–8개 (끝 토큰 포함) |
+
+- **정답 라벨이 없어 CER은 아직 못 쟀다.** 라벨 JSON을 받으면 조각별 CER을 계산한다
+- `confidence`가 거의 1에 몰려 있다. 쉬운 대본 문장, 조용한 녹음이라 그렇다. **이 분포로는 백엔드 기준값을 정할 수 없다** → 다른 화자 데이터로 다시 본다
+- 짝 확인(#28): 사람이 직접 듣는 확인은 남아 있다
+
+### 정답 문장 (모델 전사, 참고용. 라벨로 교체 예정)
+문 열어 / 나무가 많아 / 내일 만나 / 이제 내려 / 머리 말려 / 여기 놔요 / 나비가 날아요 / 엄마가 노래해 / 머리 말려요 / 여기 놨어요 / 여기 놔 / 여기 놔요 / 머리 말려 / 머리 말려요 / 여기 놨어요 / 머리 말렸어요 / 여기 놓을 거예요 / 밥 먹었죠 / 집에 아무도 없겠지 / 발이 얼었어요 / 길이 많이 막혀요 / 선생님이 하셨어요 / 거기 갈래 / 그렇게 될 리가 없지 / 전화 왔었어요 / 여기까지 걸어 왔어요 / 방이 추운 거 같애 / 날씨가 추워요 / 음악 켜 / 날씨가 더워요
 
 ---
 

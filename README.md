@@ -1,9 +1,33 @@
 # marieum-ai
 
-구음장애 특화 Whisper 모델(`yoona-J/ASR_Whisper_Disease_General`)을 L4 GPU 서버에 배포하고, 한국어 음성을 텍스트로 바꾸는 FastAPI ML 서버 (`POST /asr`).
+구음장애 특화 Whisper 모델(`yoona-J/ASR_Whisper_Disease_General`)을 L4 GPU 서버에 올려, 한국어 음성을 실시간으로 텍스트로 바꾸는 ML 서버 (WebSocket `/asr-stream`).
 
-- 현재 상태: 캘리브레이션 완료, 구현 시작 전
-- 합의 내용: [CALIBRATION.md](CALIBRATION.md)
+- 현재 상태: v4 스트리밍 서버 구현, GPU 서버 localhost에서 시험 완료 (배포 전)
+- 합의 내용과 실측: [CALIBRATION.md](CALIBRATION.md) §0
+
+## 구성
+
+| 경로 | 내용 |
+|---|---|
+| `server/app.py` | FastAPI: `/asr-stream`, `/healthz`, `/livez` |
+| `server/engine.py` | Whisper 추론 (fp16, 묶음, `no_speech_prob`) |
+| `server/scheduler.py` | GPU 작업자 (final 우선, 세션당 interim 1개) |
+| `server/stream.py` | VAD 구간 나누기, interim 확정 규칙 (torch 없음) |
+| `scripts/stream_client.py` | 테스트·부하 클라이언트 |
+| `scripts/mock_asr_server.py` | GPU 없는 Mock (포트 9001) |
+| `scripts/verify_engine.py` | 엔진이 노트북과 같은 전사를 내는지 확인 |
+| `tests/` | `python -m pytest tests -q` |
+
+## 실행
+
+```bash
+ML_MODEL_DIR=models/ASR_Whisper_Disease_General \
+  uvicorn server.app:app --host 0.0.0.0 --port 8001 --workers 1
+python scripts/stream_client.py --wav a.wav --show                         # 발화 모드
+python scripts/stream_client.py --mode conversation --wav long.wav --show  # 실시간 대화 모드
+```
+
+인증이 없는 서버다. 8001 포트는 보안그룹에서 CPU 서버 IP만 허용한 뒤 연다.
 
 ## 데이터 주의
 
