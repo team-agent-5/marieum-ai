@@ -1,0 +1,17 @@
+# AI Hub 원본 데이터는 재배포 금지 (오디오, 라벨)
+*.wav
+*.mp3
+*.m4a
+*.webm
+라벨링데이터/
+
+# 모델 가중치는 GPU 서버에서 직접 다운로드
+models/
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
