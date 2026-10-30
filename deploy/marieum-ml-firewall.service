@@ -1,0 +1,12 @@
+[Unit]
+Description=marieum ML server port 8001 firewall (backend only)
+Before=marieum-ml.service
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/marieum-ml-firewall.sh
+
+[Install]
+WantedBy=multi-user.target

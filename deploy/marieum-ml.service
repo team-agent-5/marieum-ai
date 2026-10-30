@@ -1,0 +1,19 @@
+[Unit]
+Description=marieum ML server (WebSocket /asr-stream, port 8001)
+After=network-online.target marieum-ml-firewall.service
+Wants=network-online.target
+Requires=marieum-ml-firewall.service
+
+[Service]
+User=ncloud
+WorkingDirectory=/home1/ncloud/marieum-ml
+Environment=ML_MODEL_DIR=models/ASR_Whisper_Disease_General
+Environment=ML_DEBUG_SAVE=0
+Environment=PYTHONUNBUFFERED=1
+# 워커 1개 고정 (CALIBRATION.md §8). 8001은 marieum-ml-firewall이 백엔드만 허용
+ExecStart=/home1/ncloud/marieum-ml/.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8001 --workers 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
