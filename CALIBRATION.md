@@ -121,6 +121,7 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
   - `marieum-ml.service`: `0.0.0.0:8001`, 죽으면 재시작, 부팅 시 시작
   - `marieum-ml-firewall.service`: GPU 서버 iptables로 8001은 localhost와 백엔드 서버(`inno-server-006`, `10.1.1.11`)만 허용. ACG는 8001을 막지 않는다 (SSL VPN에서 온 요청이 GPU 서버까지 와서 iptables에 막힘)
   - 확인: 백엔드 서버 `curl http://10.1.2.11:8001/healthz` → 200, SSL VPN(Mac) → 연결 안 됨
+- **열린 포트 점검 (2026-10-31):** GPU 서버가 밖으로 여는 포트는 22(SSH), 111(rpcbind), 8001(백엔드만 허용). SSL VPN(Mac)에서 22와 111에 연결된다. NFS 마운트가 없어 rpcbind는 쓰지 않는다 → 끌지 팀 확인 (`sudo systemctl disable --now rpcbind rpcbind.socket`, NCP NAS를 붙일 때 다시 켬)
 - 백엔드 서버에서 지연 다시 재기
 - 앱 마이크 음성(실제 경로)으로 시험. 지금은 AI Hub 샘플만
 - 정답 라벨로 CER (라벨 JSON 필요)

@@ -16,7 +16,7 @@
 | `scripts/stream_client.py` | 테스트·부하 클라이언트 |
 | `scripts/mock_asr_server.py` | GPU 없는 Mock (포트 9001) |
 | `scripts/verify_engine.py` | 엔진이 노트북과 같은 전사를 내는지 확인 |
-| `tests/` | `python -m pytest tests -q` |
+| `tests/` | `python -m pytest tests -q` (GPU 없이 돈다: 구간 나누기 단위 테스트 + 가짜 엔진으로 WebSocket 통합 테스트) |
 
 ## 실행
 
