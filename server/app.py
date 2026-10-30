@@ -95,10 +95,10 @@ def load_model():
 
 
 async def gpu_info_loop():
-    import torch
     while True:
         await asyncio.sleep(10)
         try:
+            import torch
             free, total = torch.cuda.mem_get_info()
             state["gpu"].update(memory_free_mb=free // 2**20, memory_total_mb=total // 2**20)
         except Exception:  # noqa: BLE001
