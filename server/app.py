@@ -80,8 +80,8 @@ def load_model():
         for b in range(1, S.batch_max + 1):
             eng.transcribe([np.zeros(SR, np.float32)] * b, 8)
         log("warmup_done", warmup_s=round(time.perf_counter() - t, 2))
-        for _ in range(4):  # VAD 모델 미리 몇 개 (세션 시작 지연 줄이기)
-            vads.free.append(vads.acquire())
+        # VAD 모델 미리 4개 (세션 시작 지연 줄이기). 한 번에 만들고 넣어야 4개가 된다
+        vads.free.extend([vads.acquire() for _ in range(4)])
         state["engine"] = eng
         free, total = torch.cuda.mem_get_info()
         state["gpu"] = {"name": torch.cuda.get_device_name(0), "memory_free_mb": free // 2**20,
