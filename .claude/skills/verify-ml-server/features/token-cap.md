@@ -1,11 +1,11 @@
 # 출력 토큰 상한
 
-Whisper가 한 번 전사할 때 만들 수 있는 토큰 수에 조각마다 상한을 둔다. 상한은 말소리 길이에 비례하고(`cap = min(고정 상한, ceil(초 × R) + floor)`), 고정 상한(interim 96 / final 128)을 넘지 않는다. 사용자에게 보이는 효과는 두 가지다. 같은 말을 반복하는 폭주 출력이 짧게 끊겨 화면에 긴 쓰레기 글자가 덜 뜨고 다른 세션의 interim이 덜 밀린다. 정상 문장의 텍스트는 전혀 바뀌지 않는다. 설계 배경은 저장소 루트 `MAX_NEW_TOKENS.md`에 있다.
+Whisper가 한 번 전사할 때 만들 수 있는 토큰 수에 조각마다 상한을 둔다. 상한은 Whisper에 넣는 음성 길이에 비례하고(`cap = min(고정 상한, ceil(초 × R) + floor)`), 고정 상한(interim 96 / final 128)을 넘지 않는다. 사용자에게 보이는 효과는 두 가지다. 같은 말을 반복하는 폭주 출력이 짧게 끊겨 화면에 긴 쓰레기 글자가 덜 뜨고 다른 세션의 interim이 덜 밀린다. 정상 문장의 텍스트는 전혀 바뀌지 않는다. 설계 배경은 저장소 루트 `MAX_NEW_TOKENS.md`에 있다.
 
 ## Sub-features
 
 - `cap-log`: interim·final 로그에 그 작업에 적용된 `token_cap`이 남고, interim에도 `ended_eot`가 남는다.
-- `cap-short`: 짧은 조각의 상한이 고정값이 아니라 길이에 비례해 작다 (예: 말소리 0.5초 interim의 `token_cap`이 96보다 훨씬 작다).
+- `cap-short`: 짧은 조각의 상한이 고정값이 아니라 길이에 비례해 작다 (예: 음성 0.5초 interim의 `token_cap`이 96보다 훨씬 작다).
 - `cap-runaway`: 폭주한 조각이 자기 `token_cap`에서 멈춘다 (`gen_tokens == token_cap`, `ended_eot=false`, `token_cap < 128`).
 - `cap-normal`: 끝 토큰으로 끝나던 정상 final은 텍스트가 기준선과 똑같다.
 - `cap-long`: 15초 가까이 쉼 없이 말한 구간의 final이 상한에 잘리지 않는다 (`ended_eot=true`).
