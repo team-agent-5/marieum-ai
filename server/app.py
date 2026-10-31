@@ -20,7 +20,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .config import settings as S
-from .stream import CONVERSATION, MODES, SR, UTTERANCE, Agreement, Segmenter
+from .stream import CONVERSATION, MODES, SR, UTTERANCE, Agreement, Segmenter, word_delta
+from .textfilter import syllables, too_fast
 
 ENDPOINT = "/asr-stream"
 TRACE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
@@ -160,6 +161,7 @@ class Session:
         self.seg = Segmenter(mode, make_vad(vad_model), S)
         self.agree = Agreement()
         self.agree_seg = 0
+        self.sent_words = {}  # 구간(segment_id)별로 stable_delta로 이미 내려보낸 단어
         self.odd = b""  # 홀수 바이트 프레임의 남은 1바이트
         self.bytes_total = 0
         self.t_start = time.perf_counter()
@@ -250,21 +252,43 @@ class Session:
         if r is not None and not self.closed and snap.seg_id > self.finalized_seg:
             if snap.seg_id != self.agree_seg:
                 self.agree, self.agree_seg = Agreement(), snap.seg_id
-            text = "" if self.silenced(r) else r["text"][:MAX_TEXT]
+            text = self.accept(r, snap.speech_ms)
+            if not text and r["text"] and not self.silenced(r):  # 말 속도 검사로 거부
+                self.agree = Agreement()
             stable, unstable = self.agree.update(text)
+            delta, revised = self.take_delta(snap.seg_id, stable)
             self.interim_count += 1
             self.last_interim_sent = time.perf_counter()
             latency = (time.perf_counter() - self.arrival(snap.audio_end_ms)) * 1000
             await self.conn.send(self, {
                 "type": "transcript_interim", "text": " ".join(t for t in (stable, unstable) if t),
                 "confidence": r["confidence"], "is_final": False, "segment_id": snap.seg_id,
-                "stable_text": stable, "unstable_text": unstable, "audio_end_ms": snap.audio_end_ms})
+                "stable_text": stable, "unstable_text": unstable, "audio_end_ms": snap.audio_end_ms,
+                "stable_delta": delta, "stable_revised": revised})
             log("transcript_interim", self.trace_id, status="ok", latency_ms=round(latency),
                 confidence=r["confidence"], segment_id=snap.seg_id, interim_index=self.interim_count,
                 audio_ms=len(snap.audio) * 1000 // SR, queue_ms=round(r["queue_ms"]),
                 gpu_ms=round(r["gpu_ms"]), batch=r["batch"], batch_kinds=r["kinds"],
-                gen_tokens=r["gen_tokens"], no_speech_prob=r["no_speech_prob"])
+                gen_tokens=r["gen_tokens"], no_speech_prob=r["no_speech_prob"],
+                vad_speech_ms=snap.speech_ms, syllables=syllables(r["text"]))
         self.maybe_interim()
+
+    def take_delta(self, seg_id, text):
+        """확정된 단어 중 아직 안 내려보낸 것만 (단어 단위 스트리밍용). 보낸 단어로 기록한다."""
+        sent = self.sent_words.setdefault(seg_id, [])
+        words, revised = word_delta(sent, text)
+        self.sent_words[seg_id] = text.split() if revised else sent + words
+        return " ".join(words), revised
+
+    def accept(self, r, speech_ms):
+        """전사를 보낼지 정한다. 무음이거나 말 길이에 비해 글자가 너무 많으면(지어낸 문장) 빈 글자."""
+        if self.silenced(r):
+            return ""
+        if too_fast(r["text"], speech_ms, S.max_syllables_per_s):
+            log("rejected_too_fast", self.trace_id, status="ok", speech_ms=speech_ms,
+                text_len=len(r["text"]), confidence=r["confidence"])
+            return ""
+        return r["text"][:MAX_TEXT]
 
     @staticmethod
     def silenced(r):
@@ -302,19 +326,23 @@ class Session:
         if r is None:  # VAD가 말소리를 못 찾음 → Whisper 생략 (§6)
             text, conf, nsp = "", 0.0, 1.0
         else:
-            text = "" if self.silenced(r) else r["text"][:MAX_TEXT]
+            text = self.accept(r, seg.speech_ms)
             conf, nsp = (r["confidence"] if text else 0.0), r["no_speech_prob"]
+        delta, revised = self.take_delta(seg.seg_id, text)
+        self.sent_words.pop(seg.seg_id, None)
         await self.conn.send(self, {
             "type": "transcript_final", "text": text, "confidence": conf,
             "duration_ms": seg.duration_ms, "model_version": S.model_version, "no_speech_prob": nsp,
-            "segment_id": seg.seg_id, "is_last": is_last})
+            "segment_id": seg.seg_id, "is_last": is_last,
+            "stable_delta": delta, "stable_revised": revised})
         extra = {} if r is None else {"queue_ms": round(r["queue_ms"]), "gpu_ms": round(r["gpu_ms"]),
                                        "batch": r["batch"], "batch_kinds": r["kinds"],
                                        "gen_tokens": r["gen_tokens"], "ended_eot": r["ended_eot"]}
         log("transcript_final", self.trace_id, status="ok",
             latency_ms=round((time.perf_counter() - t_close) * 1000), confidence=conf,
             segment_id=seg.seg_id, reason=seg.reason, is_last=is_last, vad_skip=r is None,
-            no_speech_prob=nsp, duration_ms=seg.duration_ms, speech_ms=len(seg.audio) * 1000 // SR,
+            no_speech_prob=nsp, duration_ms=seg.duration_ms, vad_speech_ms=seg.speech_ms,
+            asr_audio_ms=len(seg.audio) * 1000 // SR, syllables=syllables(r["text"]) if r else 0,
             **extra)
         if is_last:
             self.cleanup()
@@ -471,7 +499,11 @@ async def start_session(conn, p, trace):
         return await conn.error(trace, "INVALID_FORMAT", "language는 ko만 지원합니다.")
     if trace in conn.sessions:
         return await conn.error(trace, "INVALID_FORMAT", "이미 진행 중인 trace_id입니다.")
-    vad_model = await asyncio.get_running_loop().run_in_executor(vad_pool, vads.acquire)
+    try:
+        vad_model = await asyncio.get_running_loop().run_in_executor(vad_pool, vads.acquire)
+    except Exception as e:  # noqa: BLE001 - 응답 없이 연결이 끊기지 않게 한다
+        log("vad_acquire_failed", trace, status="error", message=repr(e))
+        return await conn.error(trace, "INTERNAL", "세션을 시작하지 못했습니다. 다시 시도하세요.")
     s = Session(conn, trace, str(p.get("patient_id", ""))[:64], mode, sr, vad_model)
     conn.sessions[trace] = s
     conn.current = s

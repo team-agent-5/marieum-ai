@@ -235,3 +235,97 @@ def test_sessions_on_separate_connections_do_not_mix(url):
         fa, fb = recv_until_last(a)[-1], recv_until_last(b)[-1]
     assert fa["trace_id"] == ta and fb["trace_id"] == tb
     assert len(fb["text"].split()) > len(fa["text"].split())
+
+
+@pytest.mark.parametrize("mode", ["utterance", "conversation"])
+@pytest.mark.parametrize("sec", [0.0, 0.1, 0.5])
+def test_silence_then_end_always_answers(url, mode, sec):
+    # 말소리 없이 end만 와도 빈 final(is_last)을 바로 보낸다 (피드백 ③)
+    with connect(url) as ws:
+        trace = start(ws, mode=mode)
+        if sec:
+            send_audio(ws, pcm(("sil", sec)))
+        ws.send(json.dumps({"type": "end", "trace_id": trace}))
+        msgs = recv_until_last(ws, timeout=3)
+    f = msgs[-1]
+    assert f["text"] == "" and f["is_last"] and f["no_speech_prob"] == 1.0
+
+
+class StoryEngine(FakeEngine):
+    """무슨 소리든 학습 문장 한 줄을 지어내는 엔진 (환각 흉내)."""
+
+    def transcribe(self, audios, max_new_tokens):
+        out, timing = super().transcribe(audios, max_new_tokens)
+        for r in out:
+            r.update(text="아들과 병원에 가보니 하필 늑막염이었다", no_speech_prob=0.0)
+        return out, timing
+
+
+def test_too_fast_text_is_dropped(url):
+    # 짧은 소리에서 긴 문장이 나오면 interim·final 모두 빈 글자 (피드백 ④)
+    import dataclasses
+
+    sch = app_mod.state["scheduler"]
+    saved, sch.engine = sch.engine, StoryEngine()
+    saved_s, app_mod.S = app_mod.S, dataclasses.replace(app_mod.S, max_syllables_per_s=10.0)
+    try:
+        with connect(url) as ws:
+            trace = start(ws)
+            send_audio(ws, pcm(("tone", 0.8), ("sil", 0.3)))
+            time.sleep(0.3)
+            ws.send(json.dumps({"type": "end", "trace_id": trace}))
+            msgs = recv_until_last(ws)
+    finally:
+        sch.engine, app_mod.S = saved, saved_s
+    assert all(m["text"] == "" for m in msgs if m["type"].startswith("transcript"))
+
+
+def test_too_fast_off_by_default_keeps_text(url):
+    # 기본값(0)은 거르지 않는다: 오탐 측정 전이라 기록만 한다
+    sch = app_mod.state["scheduler"]
+    saved, sch.engine = sch.engine, StoryEngine()
+    try:
+        with connect(url) as ws:
+            trace = start(ws)
+            send_audio(ws, pcm(("tone", 0.8)))
+            ws.send(json.dumps({"type": "end", "trace_id": trace}))
+            assert recv_until_last(ws)[-1]["text"] == "아들과 병원에 가보니 하필 늑막염이었다"
+    finally:
+        sch.engine = saved
+
+
+def test_vad_failure_on_start_answers(url):
+    def boom():
+        raise RuntimeError("vad")
+
+    saved, app_mod.vads.acquire = app_mod.vads.acquire, boom
+    try:
+        with connect(url) as ws:
+            trace = start(ws)
+            err = json.loads(ws.recv(timeout=5))
+            assert (err["type"], err["code"], err["trace_id"]) == ("error", "INTERNAL", trace)
+    finally:
+        app_mod.vads.acquire = saved
+
+
+@pytest.mark.parametrize("mode", ["utterance", "conversation"])
+def test_stable_delta_streams_each_word_once(url, mode):
+    # 확정된 단어만 한 번씩 내려준다: interim들의 stable_delta + final의 stable_delta = final 문장
+    with connect(url) as ws:
+        trace = start(ws, mode=mode)
+        send_audio(ws, pcm(("tone", 3.0)))
+        time.sleep(0.6)
+        ws.send(json.dumps({"type": "end", "trace_id": trace}))
+        msgs = recv_until_last(ws)
+    deltas = [m["stable_delta"] for m in msgs if m["type"] == "transcript_interim"]
+    f = [m for m in msgs if m["type"] == "transcript_final"][0]
+    assert any(deltas), "말하는 도중 확정 단어가 나와야 한다"
+    assert all("stable_revised" in m for m in msgs if m["type"].startswith("transcript"))
+    assert not f["stable_revised"]
+    assert " ".join(d for d in deltas + [f["stable_delta"]] if d) == f["text"]
+    # 각 interim의 stable_delta를 이어 붙이면 그 시점의 stable_text
+    acc = []
+    for m in msgs:
+        if m["type"] == "transcript_interim":
+            acc += m["stable_delta"].split()
+            assert " ".join(acc) == m["stable_text"]

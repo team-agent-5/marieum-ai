@@ -12,6 +12,8 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging as hf_logging
 
+from .textfilter import clean_text
+
 # generate()마다 "output_scores is not valid" 경고가 찍힌다. 동작에는 영향 없음 (§4 스모크 테스트)
 hf_logging.set_verbosity_error()
 
@@ -76,7 +78,7 @@ class AsrEngine:
                 if tid not in self.special:
                     lp.append(float(tok_logp[b, i]))
             results.append({
-                "text": texts[b].strip(),
+                "text": clean_text(texts[b]),
                 "confidence": round(float(np.mean(np.exp(lp))), 4) if lp else 0.0,
                 "avg_logprob": float(np.mean(lp)) if lp else float("-inf"),
                 "no_speech_prob": round(float(no_speech[b]), 4),

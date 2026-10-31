@@ -34,6 +34,7 @@ class Segment:
     duration_ms: int  # 자르기 전 구간 길이
     end_ms: int  # 세션 시작 기준 구간 끝 위치
     reason: str  # silence | max_length | end | too_long
+    speech_ms: int = 0  # VAD가 말소리로 본 창의 합
 
 
 @dataclass
@@ -41,6 +42,7 @@ class Snapshot:
     seg_id: int
     audio: np.ndarray
     audio_end_ms: int  # 세션 시작 기준, 이 음성이 끝나는 위치
+    speech_ms: int = 0
 
 
 class Segmenter:
@@ -161,11 +163,15 @@ class Segmenter:
         if has_speech:
             a = max(0, idx[0] - self.pad_win)
             b = min(len(self.windows), idx[-1] + 1 + self.pad_win)
+            if self.mode == UTTERANCE:
+                # 문장 끝은 앱이 end로 정한다. 작게 끝나는 말끝(VAD가 놓치기 쉬움)이 빠지지 않게
+                # 받은 소리 끝까지 쓴다 → final 음성이 항상 interim 음성을 포함한다 (피드백 ②)
+                b = len(self.windows)
             audio = np.concatenate(self.windows[a:b])
         else:
             audio = np.zeros(0, np.float32)
         seg = Segment(self.seg_id, audio, has_speech, _ms(len(self.windows)),
-                      _ms(self.seg_start_win + len(self.windows)), reason)
+                      _ms(self.seg_start_win + len(self.windows)), reason, _ms(len(idx)))
         self.seg_id += 1
         if self.mode == CONVERSATION:
             self.preroll.clear()
@@ -216,7 +222,7 @@ class Segmenter:
         first = next(i for i, p in enumerate(self.probs) if p >= self.thr)
         a = max(0, first - self.pad_win)  # 발화 모드는 세션 시작부터 쌓이므로 앞 무음을 자른다
         return Snapshot(self.seg_id, np.concatenate(self.windows[a:]),
-                        _ms(self.seg_start_win + len(self.windows)))
+                        _ms(self.seg_start_win + len(self.windows)), _ms(self.speech_win))
 
 
 _PUNCT = re.compile(r"[.,?!~·…]")
@@ -255,3 +261,16 @@ class Agreement:
         n = len(self.committed)
         tail = words[n:] if len(words) > n else []
         return " ".join(self.committed), " ".join(tail)
+
+
+def word_delta(sent, text):
+    """이미 내려보낸 단어(sent) 뒤로 새로 붙은 단어만 돌려준다: (새 단어 목록, revised).
+
+    text가 sent로 시작하지 않으면(앞에서 보낸 단어와 달라졌으면) text 전체와 revised=True.
+    구두점은 무시하고 비교한다 ("주세요"와 "주세요."는 같다).
+    """
+    words = text.split()
+    n = len(sent)
+    if [_norm(w) for w in words[:n]] == [_norm(w) for w in sent]:
+        return words[n:], False
+    return words, True

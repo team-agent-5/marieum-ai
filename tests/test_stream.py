@@ -37,9 +37,19 @@ def test_utterance_one_final_trimmed():
     assert closed == []
     last = seg.finish()
     assert last.has_speech and last.reason == "end" and last.seg_id == 0
-    # 앞뒤 무음을 자르고 패딩 200ms씩만 남긴다
-    assert abs(len(last.audio) / SR - 2.4) < 0.1
+    # 앞 무음만 자른다(패딩 200ms). 끝은 end까지 받은 소리를 다 쓴다 (작은 말끝 보존)
+    assert abs(len(last.audio) / SR - 3.2) < 0.1
     assert seg.finish() is None
+
+
+def test_utterance_final_keeps_quiet_tail():
+    # VAD가 놓치는 작은 말끝도 final에 들어간다 (end까지 받은 소리 전부, 피드백 ②)
+    seg = Segmenter(UTTERANCE, fake_vad, CFG)
+    quiet = (0.005 * np.sin(2 * np.pi * 220 * np.arange(SR) / SR)).astype(np.float32)  # VAD 기준 아래
+    feed_frames(seg, np.concatenate([silence(1.0), tone(2.0), quiet, silence(0.5)]))
+    last = seg.finish()
+    assert abs(len(last.audio) / SR - 3.7) < 0.1  # 앞 패딩 0.2 + 말 2.0 + 작은 말끝 1.0 + 무음 0.5
+    assert abs(last.speech_ms / 1000 - 2.0) < 0.1
 
 
 def test_utterance_silence_only_has_no_speech():
@@ -132,3 +142,13 @@ def test_agreement_ignores_punctuation():
     a = Agreement()
     a.update("물 주세요.")
     assert a.update("물 주세요, 지금")[0] == "물 주세요,"
+
+
+def test_word_delta():
+    from server.stream import word_delta
+    assert word_delta([], "물") == (["물"], False)
+    assert word_delta(["물"], "물 좀") == (["좀"], False)
+    assert word_delta(["물", "좀"], "물 좀") == ([], False)
+    assert word_delta(["물", "좀"], "물 좀 주세요.") == (["주세요."], False)
+    assert word_delta(["물", "좀"], "물, 좀 주세요") == (["주세요"], False)  # 구두점 무시
+    assert word_delta(["믈"], "물 좀 주세요") == (["물", "좀", "주세요"], True)  # 앞에서 보낸 단어가 바뀜
