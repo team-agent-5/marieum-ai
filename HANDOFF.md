@@ -20,7 +20,7 @@
 ## 2. 꼭 지킬 것
 
 1. **세션마다 WebSocket 연결을 따로 연다.** v1.0 §5.1.2는 오디오 프레임을 "가장 최근 `start`의 세션"에 넣는다. 연결 하나에서 두 환자 세션이 겹치면 앞 환자의 오디오가 뒤 환자 세션으로 들어간다. 연결 하나를 계속 쓰려면 세션이 절대 겹치지 않게 해야 한다
-2. **오디오는 PCM16, 16kHz, 모노, little-endian.** 100ms(3,200샘플 = 6,400바이트)씩 바이너리 프레임으로 보낸다. 컨테이너(WAV 헤더, WebM, Ogg)는 백엔드가 벗긴다. **Opus는 받지 않는다** (`INVALID_FORMAT`). 샘플레이트는 8–48kHz를 받지만 16kHz를 권장한다
+2. **오디오는 PCM16, 16kHz, 모노, little-endian.** 100ms(1,600샘플 = 3,200바이트)씩 바이너리 프레임으로 보낸다. 컨테이너(WAV 헤더, WebM, Ogg)는 백엔드가 벗긴다. **Opus는 받지 않는다** (`INVALID_FORMAT`). 샘플레이트는 8–48kHz를 받지만 16kHz를 권장한다
 3. **분기는 `type`과 `code`로 한다.** 오디오는 실제 속도로 흘려 보내면 된다. 한꺼번에 몰아 보내도 동작은 하지만 interim이 덜 나온다
 4. `trace_id`는 영문·숫자·`-`·`_` 1–64자 (UUIDv4 그대로 OK)
 
@@ -87,7 +87,8 @@ keepalive: `{"type": "ping", "trace_id": "keepalive-..."}` → `{"type": "pong",
 
 | | `utterance` (기본, v4 그대로) | `conversation` (실시간 대화) |
 |---|---|---|
-| 용도 | 버튼 누르고 한 문장 → 후보 추천 | 말하는 동안 단어가 계속 화면에 나오는 대화 |
+| 기획서 모드 | ⭐ 정확도 모드 | ⚡ 실시간 모드 (S16) |
+| 용도 | 버튼 누르고 한 문장 → 후보 추천 | 말하는 동안 구간 final마다 후보 없이 바로 TTS (bypass) |
 | final | `end` 후 1회 (`segment_id: 0`, `is_last: true`) | 0.8초 쉴 때마다 구간 final (`is_last: false`), `end` 후 마지막 final (`is_last: true`, 남은 말이 없으면 `text: ""`) |
 | 길이 상한 | 10초. 넘으면 `AUDIO_TOO_LONG` + 자동 final | 구간 최대 6초 (쉼 없이 말하면 6초에서 끊어 다음 구간으로), 세션 최대 600초 |
 | interim | 세션 전체를 다시 전사 | 현재 구간만 다시 전사 |
@@ -133,9 +134,32 @@ python scripts/stream_client.py --url ws://10.1.2.11:8001/asr-stream --wav a.wav
 python scripts/stream_client.py --url ws://10.1.2.11:8001/asr-stream --wav a.wav --mode conversation --show
 ```
 
-## 10. 함께 정할 것
+## 10. 백엔드 설계 문서와 맞출 부분
+
+`design/api-endpoints.md` v4 §3.7(앱 ↔ 백엔드 `/utterance/stream`)과 이 문서(백엔드 ↔ ML `/asr-stream`)는 메시지 모양이 조금 다르다. 바이너리 오디오는 그대로 넘기면 되지만, JSON은 백엔드가 아래처럼 바꿔서 보낸다.
+
+| 앱 → 백엔드 (§3.7) | 백엔드 → ML |
+|---|---|
+| `start.codec: "pcm16"` | `start.encoding: "pcm16"` |
+| `start`에 `patient_id` 없음 (JWT에 있음) | `patient_id`를 JWT에서 꺼내 넣는다 (로그용, 선택) |
+| `end` (필드 없음) | `end`에 `trace_id` **필수**. 없으면 `INVALID_FORMAT` |
+| `ping.ts` | ML 쪽 ping은 백엔드가 따로 보낸다 (`trace_id`는 아무 값) |
+| ML `error.code` | 앱에는 `error.error_code`로 |
+| ML interim의 `stable_text`/`unstable_text` | 앱에 함께 넘기면 진하게/흐리게 표시할 수 있다 (M5) |
+
+- **모드 (2026-10-31 결정):**
+  - ⭐ 정확도 모드 → ML `mode: "utterance"`. 버튼 누르고 한 문장, 10초 상한, final 1번 → 후보 3개 → 선택 → TTS
+  - ⚡ 실시간 모드 → ML `mode: "conversation"`. **말하는 동안 계속 전달한다.** 0.8초 쉴 때마다(쉼 없이 말하면 6초마다) 구간 final(`is_last: false`)이 오고, 백엔드는 그때마다 후보 없이 바로 TTS로 보낸다 (bypass, `phrase_log.source="voice_bypass"`). 세션은 `end`(환자가 종료)나 600초까지 유지되고 마지막 final은 `is_last: true`
+  - 실시간 모드에서는 기획서 S16의 "10초 상한"이 세션 600초 / 구간 6초로 바뀐다. 기획서·백엔드 설계(`accuracy_mode`는 LLM 재추천 스위치라 별개)에 반영 필요
+- **연결:** 앱 WebSocket 하나가 발화 하나(§3.7.1)이므로, ML 연결도 발화마다 새로 열면 §2-1이 저절로 지켜진다
+- **10초 상한:** 백엔드와 ML이 둘 다 10초에서 자르면 백엔드가 먼저 끊어 ML의 final을 못 받을 수 있다. 백엔드는 10초에서 `end`를 보내거나, ML의 `AUDIO_TOO_LONG` 다음에 오는 final(`is_last: true`)을 받아서 처리한다
+- **빈 final:** final `text`가 `""`이면(무음) 후보 계산 대신 `ask_again`으로 보낸다. 실시간 모드는 환자 확인 없이 TTS로 가므로, 빈 구간 final은 **읽지 않고 건너뛴다** (세션은 계속). 이상한 텍스트를 그대로 읽지 않게 confidence 기준도 둬야 한다 (§8: 0.4 기준은 거의 걸리지 않는다)
+- **실시간 모드 TTS 순서:** 구간 final은 `segment_id` 순서로 온다. TTS가 재생 중일 때 다음 구간 final이 오면 큐에 넣어 차례로 읽는다 (겹쳐 읽지 않기)
+- **Mock:** 백엔드 자체 Mock(`MARIEUM_MOCK_ASR=1`, interim 2회·final 1회 고정)은 추가 필드가 없어도 앱 흐름 시험에는 문제없다. 실제와 같은 메시지가 필요하면 `scripts/mock_asr_server.py`를 쓴다
+
+## 11. 함께 정할 것
 
 1. 모델: 구음장애 특화 whisper-small 유지 (현재) vs v1.0 문서의 large-v3-turbo
 2. 세션마다 연결 (권장) vs 연결 하나 공유
-3. 앱이 `conversation` 모드를 쓸지, 쓴다면 화면 표시 방식
+3. 실시간 모드(`conversation`) 화면 표시 방식과 종료 방법 (버튼으로 `end`, 일정 시간 무음이면 자동 `end` 등)
 4. confidence 기준값 (0.3 / 0.4) 재설정

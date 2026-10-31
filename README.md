@@ -2,8 +2,12 @@
 
 구음장애 특화 Whisper 모델(`yoona-J/ASR_Whisper_Disease_General`)을 L4 GPU 서버에 올려, 한국어 음성을 실시간으로 텍스트로 바꾸는 ML 서버 (WebSocket `/asr-stream`).
 
-- 현재 상태: v4 스트리밍 서버 구현, GPU 서버 localhost에서 시험 완료 (배포 전)
+- 현재 상태: v4 스트리밍 서버 구현, GPU 서버에 배포되어 동작 중, 백엔드 서버에서 접속 확인 완료
+- 팀원용 쉬운 안내: [TEAM_GUIDE.md](TEAM_GUIDE.md)
+- 구현 정리: [ML_SERVER.md](ML_SERVER.md)
+- 시험 결과와 지표: [TEST_RESULTS.md](TEST_RESULTS.md)
 - 합의 내용과 실측: [CALIBRATION.md](CALIBRATION.md) §0
+- 백엔드 연동: [HANDOFF.md](HANDOFF.md), 질문 답변: [BACKEND_FAQ.md](BACKEND_FAQ.md), 중계 코드 프롬프트: [BACKEND_RELAY_PROMPT.md](BACKEND_RELAY_PROMPT.md)
 
 ## 구성
 
