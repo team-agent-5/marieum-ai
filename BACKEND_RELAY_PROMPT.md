@@ -68,7 +68,7 @@ ML 서버가 보낸 전사 결과를 받아 앱에 보내 준다. 백엔드는 �
 | 앱 모드 | ML mode | 흐름 |
 |---|---|---|
 | ⭐ 정확도 (기본) | "utterance" | 버튼 누르고 말하기(최대 10초) → end → final 1번(is_last:true) → 후보 3개 → 환자 선택 → TTS |
-| ⚡ 실시간 | "conversation" | 말하는 동안 계속 전달. 0.8초 쉴 때마다(쉼 없이 말하면 6초마다) 구간 final(is_last:false)이 오고, 올 때마다 후보 없이 바로 TTS(bypass). 환자가 종료하면 end → 마지막 final(is_last:true) → 세션 끝 |
+| ⚡ 실시간 | "conversation" | 말하는 동안 계속 전달. 1.75초 쉴 때마다(쉼 없이 말하면 15초마다) 구간 final(is_last:false)이 오고, 올 때마다 후보 없이 바로 TTS(bypass). 환자가 종료하면 end → 마지막 final(is_last:true) → 세션 끝 |
 
 ⚡ 실시간 모드 처리 규칙:
 - 구간 final(is_last:false)을 받아도 세션을 닫지 않는다. is_last:true일 때만 닫는다

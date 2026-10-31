@@ -89,8 +89,8 @@ keepalive: `{"type": "ping", "trace_id": "keepalive-..."}` → `{"type": "pong",
 |---|---|---|
 | 기획서 모드 | ⭐ 정확도 모드 | ⚡ 실시간 모드 (S16) |
 | 용도 | 버튼 누르고 한 문장 → 후보 추천 | 말하는 동안 구간 final마다 후보 없이 바로 TTS (bypass) |
-| final | `end` 후 1회 (`segment_id: 0`, `is_last: true`) | 0.8초 쉴 때마다 구간 final (`is_last: false`), `end` 후 마지막 final (`is_last: true`, 남은 말이 없으면 `text: ""`) |
-| 길이 상한 | 10초. 넘으면 `AUDIO_TOO_LONG` + 자동 final | 구간 최대 6초 (쉼 없이 말하면 6초에서 끊어 다음 구간으로), 세션 최대 600초 |
+| final | `end` 후 1회 (`segment_id: 0`, `is_last: true`) | 1.75초 쉴 때마다 구간 final (`is_last: false`), `end` 후 마지막 final (`is_last: true`, 남은 말이 없으면 `text: ""`) |
+| 길이 상한 | 10초. 넘으면 `AUDIO_TOO_LONG` + 자동 final | 구간 최대 15초 (쉼 없이 말하면 15초에서 끊어 다음 구간으로), 세션 최대 600초 |
 | interim | 세션 전체를 다시 전사 | 현재 구간만 다시 전사 |
 
 - 한 세션 안에서 final은 `segment_id` 순서대로 온다. 구간 final 뒤에는 그 구간의 interim이 오지 않는다
@@ -149,8 +149,8 @@ python scripts/stream_client.py --url ws://10.1.2.11:8001/asr-stream --wav a.wav
 
 - **모드 (2026-10-31 결정):**
   - ⭐ 정확도 모드 → ML `mode: "utterance"`. 버튼 누르고 한 문장, 10초 상한, final 1번 → 후보 3개 → 선택 → TTS
-  - ⚡ 실시간 모드 → ML `mode: "conversation"`. **말하는 동안 계속 전달한다.** 0.8초 쉴 때마다(쉼 없이 말하면 6초마다) 구간 final(`is_last: false`)이 오고, 백엔드는 그때마다 후보 없이 바로 TTS로 보낸다 (bypass, `phrase_log.source="voice_bypass"`). 세션은 `end`(환자가 종료)나 600초까지 유지되고 마지막 final은 `is_last: true`
-  - 실시간 모드에서는 기획서 S16의 "10초 상한"이 세션 600초 / 구간 6초로 바뀐다. 기획서·백엔드 설계(`accuracy_mode`는 LLM 재추천 스위치라 별개)에 반영 필요
+  - ⚡ 실시간 모드 → ML `mode: "conversation"`. **말하는 동안 계속 전달한다.** 1.75초 쉴 때마다(쉼 없이 말하면 15초마다) 구간 final(`is_last: false`)이 오고, 백엔드는 그때마다 후보 없이 바로 TTS로 보낸다 (bypass, `phrase_log.source="voice_bypass"`). 세션은 `end`(환자가 종료)나 600초까지 유지되고 마지막 final은 `is_last: true`
+  - 실시간 모드에서는 기획서 S16의 "10초 상한"이 세션 600초 / 구간 15초로 바뀐다. 기획서·백엔드 설계(`accuracy_mode`는 LLM 재추천 스위치라 별개)에 반영 필요
 - **연결:** 앱 WebSocket 하나가 발화 하나(§3.7.1)이므로, ML 연결도 발화마다 새로 열면 §2-1이 저절로 지켜진다
 - **10초 상한:** 백엔드와 ML이 둘 다 10초에서 자르면 백엔드가 먼저 끊어 ML의 final을 못 받을 수 있다. 백엔드는 10초에서 `end`를 보내거나, ML의 `AUDIO_TOO_LONG` 다음에 오는 final(`is_last: true`)을 받아서 처리한다
 - **빈 final:** final `text`가 `""`이면(무음) 후보 계산 대신 `ask_again`으로 보낸다. 실시간 모드는 환자 확인 없이 TTS로 가므로, 빈 구간 final은 **읽지 않고 건너뛴다** (세션은 계속). 이상한 텍스트를 그대로 읽지 않게 confidence 기준도 둬야 한다 (§8: 0.4 기준은 거의 걸리지 않는다)

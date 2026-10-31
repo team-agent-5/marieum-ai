@@ -101,7 +101,7 @@
 | 규칙 | utterance | conversation |
 |---|---|---|
 | 구간 시작 | 세션 시작부터 | 첫 말소리 창. 그 앞 200ms(패딩)를 붙인다 |
-| 구간 끝 | `end` 또는 10초 초과 | 0.8초 쉼, 구간 6초, `end`, 세션 600초 초과 |
+| 구간 끝 | `end` 또는 10초 초과 | 1.75초 쉼, 구간 15초, `end`, 세션 600초 초과 |
 | 짧은 소리 | 말소리 150ms 미만이면 "말소리 없음" | 150ms 미만 구간은 버린다 (숨소리, 클릭음) |
 | 최대 길이에서 자르기 | — | 마지막 5초 안의 **가장 늦은 쉼**에서 자르고 나머지는 다음 구간으로. 쉼이 없으면 그 자리에서 자른다 |
 | final에 넣는 음성 | 첫 말소리 −200ms ~ 마지막 말소리 +200ms | 같음 |
@@ -149,8 +149,8 @@ VAD 설정은 기존 캘리브레이션 값 그대로다: threshold 0.5, 앞뒤 
 | | `utterance` (기본) | `conversation` |
 |---|---|---|
 | 용도 | ⭐ 정확도 모드: 버튼 누르고 한 문장 → 후보 추천 | ⚡ 실시간 모드: 말하는 동안 구간 final마다 바로 TTS (bypass) |
-| final | `end` 후 1회 (`segment_id: 0`, `is_last: true`) | 0.8초 쉴 때마다 구간 final (`is_last: false`), `end` 후 마지막 final (`is_last: true`) |
-| 길이 상한 | 10초 → `AUDIO_TOO_LONG` + 자동 final | 구간 6초 (넘으면 쉼에서 끊음), 세션 600초 |
+| final | `end` 후 1회 (`segment_id: 0`, `is_last: true`) | 1.75초 쉴 때마다 구간 final (`is_last: false`), `end` 후 마지막 final (`is_last: true`) |
+| 길이 상한 | 10초 → `AUDIO_TOO_LONG` + 자동 final | 구간 15초 (넘으면 쉼에서 끊음), 세션 600초 |
 | interim 범위 | 세션 전체 | 현재 구간만 |
 
 ---
@@ -187,10 +187,11 @@ VAD 설정은 기존 캘리브레이션 값 그대로다: threshold 0.5, 앞뒤 
 | `ML_VAD_THRESHOLD` | 0.5 | 말소리 판정 |
 | `ML_SPEECH_PAD_MS` | 200 | 말소리 앞뒤 여유 |
 | `ML_MIN_SPEECH_MS` | 150 | 이보다 짧은 소리는 잡음 |
-| `ML_END_SILENCE_MS` | 800 | 대화 모드에서 구간을 닫는 쉼 |
+| `ML_END_SILENCE_MS` | 1750 | 대화 모드에서 구간을 닫는 쉼 |
 | `ML_UTTERANCE_MAX_S` | 10 | 발화 모드 최대 길이 |
-| `ML_MAX_SEGMENT_S` | 6 | 대화 모드 구간 최대 길이 |
+| `ML_MAX_SEGMENT_S` | 15 | 대화 모드 구간 최대 길이 |
 | `ML_SESSION_MAX_S` | 600 | 대화 모드 세션 최대 길이 |
+| `ML_ASR_MAX_S` | 60 | `POST /asr` 파일 최대 길이 |
 | `ML_NO_SPEECH_THRESHOLD` / `ML_LOGPROB_THRESHOLD` | 0.6 / 0.0 | 무음 판정 (0.0 = logprob 조건 끔) |
 | `ML_DEBUG_SAVE` | 0 | 1이면 세션 음성을 `/tmp/asr-debug/{trace_id}.wav`에 저장, 30분 뒤 삭제. **심사장에서는 반드시 0** |
 
