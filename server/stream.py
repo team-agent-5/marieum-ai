@@ -34,6 +34,7 @@ class Segment:
     duration_ms: int  # 자르기 전 구간 길이
     end_ms: int  # 세션 시작 기준 구간 끝 위치
     reason: str  # silence | max_length | end | too_long
+    vad_speech_ms: int  # VAD 말소리 창 수 × 32ms. 구간 중간 쉼은 빠진다 (출력 토큰 상한 계산용)
 
 
 @dataclass
@@ -41,6 +42,7 @@ class Snapshot:
     seg_id: int
     audio: np.ndarray
     audio_end_ms: int  # 세션 시작 기준, 이 음성이 끝나는 위치
+    vad_speech_ms: int
 
 
 class Segmenter:
@@ -165,7 +167,7 @@ class Segmenter:
         else:
             audio = np.zeros(0, np.float32)
         seg = Segment(self.seg_id, audio, has_speech, _ms(len(self.windows)),
-                      _ms(self.seg_start_win + len(self.windows)), reason)
+                      _ms(self.seg_start_win + len(self.windows)), reason, _ms(len(idx)))
         self.seg_id += 1
         if self.mode == CONVERSATION:
             self.preroll.clear()
@@ -176,7 +178,7 @@ class Segmenter:
         return seg
 
     def _empty(self, reason):
-        seg = Segment(self.seg_id, np.zeros(0, np.float32), False, 0, self.elapsed_ms, reason)
+        seg = Segment(self.seg_id, np.zeros(0, np.float32), False, 0, self.elapsed_ms, reason, 0)
         self.seg_id += 1
         return seg
 
@@ -216,7 +218,7 @@ class Segmenter:
         first = next(i for i, p in enumerate(self.probs) if p >= self.thr)
         a = max(0, first - self.pad_win)  # 발화 모드는 세션 시작부터 쌓이므로 앞 무음을 자른다
         return Snapshot(self.seg_id, np.concatenate(self.windows[a:]),
-                        _ms(self.seg_start_win + len(self.windows)))
+                        _ms(self.seg_start_win + len(self.windows)), _ms(self.speech_win))
 
 
 _PUNCT = re.compile(r"[.,?!~·…]")

@@ -109,6 +109,29 @@ def test_interim_cadence_and_snapshot():
     assert seg.interim_ready()
 
 
+def test_vad_speech_ms_matches_tone_length():
+    seg = Segmenter(CONVERSATION, fake_vad, CFG)
+    closed = feed_frames(seg, np.concatenate([silence(0.5), tone(1.0), silence(2.0)]))
+    assert len(closed) == 1
+    assert abs(closed[0].vad_speech_ms - 1000) <= 32
+
+
+def test_snapshot_vad_speech_ms_matches_tone_length():
+    seg = Segmenter(CONVERSATION, fake_vad, CFG)
+    feed_frames(seg, np.concatenate([silence(0.512), tone(0.608)]))
+    assert seg.interim_ready()
+    assert abs(seg.snapshot().vad_speech_ms - 608) <= 32
+
+
+def test_vad_speech_ms_skips_pause_inside_segment():
+    # 끝 무음보다 짧은 쉼은 구간을 끊지 않지만 말소리 시간에는 들어가지 않는다
+    seg = Segmenter(CONVERSATION, fake_vad, CFG)
+    feed_frames(seg, np.concatenate([tone(0.992), silence(0.992), tone(0.992)]))
+    last = seg.finish()
+    assert last.seg_id == 0 and last.duration_ms > 2900
+    assert abs(last.vad_speech_ms - 1984) <= 32
+
+
 def test_conversation_default_max_segment_hard_cut():
     seg = Segmenter(CONVERSATION, fake_vad, CFG)  # 15초, 쉼 없음 → 그 자리에서 자른다
     closed = feed_frames(seg, tone(31.0))
