@@ -8,7 +8,8 @@ import time
 
 import numpy as np
 import torch
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import (StoppingCriteria, StoppingCriteriaList, WhisperForConditionalGeneration,
+                          WhisperProcessor)
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging as hf_logging
 
@@ -16,6 +17,31 @@ from transformers.utils import logging as hf_logging
 hf_logging.set_verbosity_error()
 
 SR = 16000
+
+
+class _RowCaps(StoppingCriteria):
+    """줄마다 생성 토큰 수가 자기 상한에 닿으면 그 줄만 멈춘다."""
+
+    def __init__(self, caps):
+        self.caps = caps
+        self.start = None
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if self.start is None:  # 첫 호출은 첫 생성 토큰을 붙인 뒤다
+            self.start = input_ids.shape[1] - 1
+        return (input_ids.shape[1] - self.start) >= self.caps
+
+
+def row_result(tokens, token_logps, cap, eot, special):
+    """한 줄의 앞 cap개 생성 토큰에서 (특수 토큰을 뺀 토큰별 logprob, EOT로 끝났는지)."""
+    # Whisper는 pad_token_id가 EOT라 상한으로 멈춘 줄 뒤에 EOT가 채워진다. 줄 전체를 보면 끝난 것으로 잡힌다
+    lp = []
+    for tid, logp in zip(tokens[:cap], token_logps[:cap]):
+        if tid == eot:
+            return lp, True
+        if tid not in special:
+            lp.append(float(logp))
+    return lp, False
 
 
 class AsrEngine:
@@ -38,8 +64,8 @@ class AsrEngine:
             if i is not None and i != tok.unk_token_id)
 
     @torch.inference_mode()
-    def transcribe(self, audios, max_new_tokens):
-        """audios: 16kHz float32 배열 목록. 결과 dict 목록 (같은 순서)."""
+    def transcribe(self, audios, caps):
+        """audios: 16kHz float32 배열 목록, caps: 줄별 출력 토큰 상한. 결과 dict 목록 (같은 순서)."""
         t0 = time.perf_counter()
         feats = self.processor([a for a in audios], sampling_rate=SR, return_tensors="pt").input_features
         feats = feats.to(self.dev, self.dtype)
@@ -55,7 +81,8 @@ class AsrEngine:
         out = self.model.generate(
             encoder_outputs=BaseModelOutput(last_hidden_state=enc.last_hidden_state),
             forced_decoder_ids=self.fdi, return_dict_in_generate=True, output_scores=True,
-            max_new_tokens=max_new_tokens)
+            max_new_tokens=max(caps),
+            stopping_criteria=StoppingCriteriaList([_RowCaps(torch.tensor(caps, device=self.dev))]))
         torch.cuda.synchronize()
         t2 = time.perf_counter()
 
@@ -68,13 +95,7 @@ class AsrEngine:
 
         results = []
         for b in range(len(audios)):
-            lp, ended = [], False
-            for i, tid in enumerate(gen[b]):
-                if tid == self.eot:
-                    ended = True
-                    break
-                if tid not in self.special:
-                    lp.append(float(tok_logp[b, i]))
+            lp, ended = row_result(gen[b], tok_logp[b], caps[b], self.eot, self.special)
             results.append({
                 "text": texts[b].strip(),
                 "confidence": round(float(np.mean(np.exp(lp))), 4) if lp else 0.0,

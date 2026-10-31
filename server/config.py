@@ -23,6 +23,9 @@ class Settings:
     batch_max: int = _i("ML_BATCH_MAX", 4)
     interim_max_new_tokens: int = _i("ML_INTERIM_MAX_NEW_TOKENS", 96)
     final_max_new_tokens: int = _i("ML_FINAL_MAX_NEW_TOKENS", 128)
+    # 말소리 길이 비례 상한 (MAX_NEW_TOKENS.md). 14는 2026-10-31·11-01 GPU 로그에서 정상 final을 하나도 안 자른 값. 0이면 끔
+    token_cap_rate: float = _f("ML_TOKEN_CAP_RATE", 14.0)
+    token_cap_floor: int = _i("ML_TOKEN_CAP_FLOOR", 8)
 
     # interim
     interim_step_ms: int = _i("ML_INTERIM_STEP_MS", 500)

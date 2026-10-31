@@ -28,7 +28,11 @@ class FakeEngine:
 
     load_s = 0.0
 
-    def transcribe(self, audios, max_new_tokens):
+    def __init__(self):
+        self.caps = []  # 받은 줄별 출력 토큰 상한 (호출 순서대로)
+
+    def transcribe(self, audios, caps):
+        self.caps.extend(caps)
         out = []
         for a in audios:
             rms = float(np.sqrt((a**2).mean())) if len(a) else 0.0
@@ -142,6 +146,18 @@ def test_utterance_interims_then_one_final(url):
     # 확정분은 줄지 않는다
     stables = [m["stable_text"] for m in interims]
     assert all(b.startswith(a) for a, b in zip(stables, stables[1:]))
+
+
+def test_final_token_cap_follows_speech_length(url):
+    # 말소리 약 1초 (VAD 창 31–32개) → ceil(0.992–1.024초 × 14) + 8
+    eng = app_mod.state["scheduler"].engine
+    eng.caps.clear()
+    with connect(url) as ws:
+        trace = start(ws)
+        send_audio(ws, pcm(("tone", 1.0), ("sil", 0.5)))
+        ws.send(json.dumps({"type": "end", "trace_id": trace}))
+        recv_until_last(ws)
+    assert eng.caps[-1] in (22, 23)
 
 
 def test_utterance_silence_skips_whisper(url):

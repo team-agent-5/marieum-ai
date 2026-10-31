@@ -47,15 +47,15 @@ def main():
             ids = ref_model.generate(f, forced_decoder_ids=eng.fdi)
             ref.append(eng.processor.batch_decode(ids, skip_special_tokens=True)[0].strip())
 
-    eng.transcribe([audios[0]], 128)  # 첫 호출 제외
+    eng.transcribe([audios[0]], [128])  # 첫 호출 제외
     b1, t1 = [], []
     for a in audios:
-        r, tm = eng.transcribe([a], 128)
+        r, tm = eng.transcribe([a], [128])
         b1.append(r[0])
         t1.append(tm["gpu_ms"])
     b4, t4 = [], []
     for i in range(0, len(audios), 4):
-        r, tm = eng.transcribe(audios[i:i + 4], 128)
+        r, tm = eng.transcribe(audios[i:i + 4], [128] * len(audios[i:i + 4]))
         b4 += r
         t4.append(tm["gpu_ms"])
 
@@ -79,7 +79,7 @@ def main():
               "잡음 1초 (-40dBFS)": (rng.standard_normal(16000) * 0.01).astype(np.float32),
               "잡음 1초 (-26dBFS)": (rng.standard_normal(16000) * 0.05).astype(np.float32),
               "말소리 앞 0.5초": audios[0][16000:24000]}
-    r, _ = eng.transcribe(list(probes.values()), 128)
+    r, _ = eng.transcribe(list(probes.values()), [128] * len(probes))
     for name, x in zip(probes, r):
         print(f"   {name}: no_speech={x['no_speech_prob']:.4f} avg_logprob={x['avg_logprob']:.2f} "
               f"conf={x['confidence']:.3f} text={x['text']!r}")

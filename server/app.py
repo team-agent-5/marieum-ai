@@ -80,7 +80,7 @@ def load_model():
         # 준비 완료(/healthz 200) 전에 batch 1–4 크기로 한 번씩 돌려 둔다. #34(워밍업 안 함)를 바꾼 것
         t = time.perf_counter()
         for b in range(1, S.batch_max + 1):
-            eng.transcribe([np.zeros(SR, np.float32)] * b, 8)
+            eng.transcribe([np.zeros(SR, np.float32)] * b, [8] * b)
         log("warmup_done", warmup_s=round(time.perf_counter() - t, 2))
         # VAD 모델 미리 4개 (세션 시작 지연 줄이기). 한 번에 만들고 넣어야 4개가 된다
         vads.free.extend([vads.acquire() for _ in range(4)])
@@ -117,7 +117,8 @@ async def lifespan(app):
             eng = await loop.run_in_executor(None, load_model)
         except Exception:  # noqa: BLE001
             return
-        sch = GpuScheduler(eng, S.batch_max, S.interim_max_new_tokens, S.final_max_new_tokens)
+        sch = GpuScheduler(eng, S.batch_max, S.interim_max_new_tokens, S.final_max_new_tokens,
+                           S.token_cap_rate, S.token_cap_floor)
         sch.start()
         state["scheduler"] = sch
         state["status"] = "ok"
@@ -238,7 +239,7 @@ class Session:
             return
         snap = self.seg.snapshot()
         self.interim_inflight = True
-        fut = state["scheduler"].submit_interim(self.key, snap.audio)
+        fut = state["scheduler"].submit_interim(self.key, snap.audio, snap.vad_speech_ms)
         asyncio.create_task(self._interim(snap, fut))
 
     async def _interim(self, snap, fut):
@@ -268,7 +269,8 @@ class Session:
                 confidence=r["confidence"], segment_id=snap.seg_id, interim_index=self.interim_count,
                 audio_ms=len(snap.audio) * 1000 // SR, queue_ms=round(r["queue_ms"]),
                 gpu_ms=round(r["gpu_ms"]), batch=r["batch"], batch_kinds=r["kinds"],
-                gen_tokens=r["gen_tokens"], no_speech_prob=r["no_speech_prob"])
+                gen_tokens=r["gen_tokens"], no_speech_prob=r["no_speech_prob"], token_cap=r["token_cap"],
+                ended_eot=r["ended_eot"], vad_speech_ms=snap.vad_speech_ms)
         self.maybe_interim()
 
     def take_delta(self, seg_id, text):
@@ -288,7 +290,7 @@ class Session:
         t_close = time.perf_counter()
         sch = state["scheduler"]
         sch.cancel_interim(self.key)
-        fut = sch.submit_final(self.key, seg.audio) if seg.has_speech else None
+        fut = sch.submit_final(self.key, seg.audio, seg.vad_speech_ms) if seg.has_speech else None
         prev = self.last_final
         self.last_final = asyncio.create_task(self._final(seg, fut, prev, is_last, t_close))
         if is_last:
@@ -325,12 +327,13 @@ class Session:
             "stable_delta": delta, "stable_revised": revised})
         extra = {} if r is None else {"queue_ms": round(r["queue_ms"]), "gpu_ms": round(r["gpu_ms"]),
                                        "batch": r["batch"], "batch_kinds": r["kinds"],
-                                       "gen_tokens": r["gen_tokens"], "ended_eot": r["ended_eot"]}
+                                       "gen_tokens": r["gen_tokens"], "ended_eot": r["ended_eot"],
+                                       "token_cap": r["token_cap"]}
         log("transcript_final", self.trace_id, status="ok",
             latency_ms=round((time.perf_counter() - t_close) * 1000), confidence=conf,
             segment_id=seg.seg_id, reason=seg.reason, is_last=is_last, vad_skip=r is None,
             no_speech_prob=nsp, duration_ms=seg.duration_ms, speech_ms=len(seg.audio) * 1000 // SR,
-            **extra)
+            vad_speech_ms=seg.vad_speech_ms, **extra)
         if is_last:
             self.cleanup()
 
@@ -579,13 +582,17 @@ async def asr(request: Request, sample_rate: int | None = None, trace_id: str | 
         finally:
             vads.release(vad_model)
         sch = state["scheduler"]
-        results = await asyncio.gather(*(sch.submit_final(f"http:{trace}:{g.seg_id}", g.audio) for g in segs))
+        results = await asyncio.gather(*(sch.submit_final(f"http:{trace}:{g.seg_id}", g.audio, g.vad_speech_ms)
+                                         for g in segs))
     except Exception as e:  # noqa: BLE001
         log("asr_failed", trace, endpoint="/asr", status="error", message=repr(e))
         return asr_error(500, "INTERNAL", "전사 중 서버 오류가 발생했습니다.", trace)
 
     out = []
     for g, r in zip(segs, results):
+        log("transcript_file_segment", trace, endpoint="/asr", status="ok", segment_id=g.seg_id,
+            gen_tokens=r["gen_tokens"], ended_eot=r["ended_eot"], token_cap=r["token_cap"],
+            vad_speech_ms=g.vad_speech_ms)
         text = "" if Session.silenced(r) else r["text"][:MAX_TEXT]
         if text:
             out.append({"text": text, "confidence": r["confidence"],
