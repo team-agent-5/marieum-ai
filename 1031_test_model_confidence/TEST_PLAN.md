@@ -24,13 +24,18 @@ GPU 서버(`inno-gpu-006`, NCP)의 운영 서비스는 건드리지 않는다.
 | 항목 | 운영 (그대로 둠) | 실험 |
 |---|---|---|
 | 폴더 | `~/marieum-ml` (systemd, `Restart=always`) | `~/exp-1031` (scp로 따로 올림) |
-| 주소 | `0.0.0.0:8001`, 방화벽으로 백엔드만 허용 | **`127.0.0.1:8002`** (방화벽이 8001만 막으므로 `0.0.0.0` 금지) |
+| 주소 | `0.0.0.0:8001`, 방화벽으로 백엔드만 허용 | **`127.0.0.1:8002`** (비어 있을 때. 방화벽이 8001만 막으므로 `0.0.0.0` 금지) |
 | 서버 코드 | `main`과 같음 | 운영 폴더의 `server/`를 복사해서 그대로 씀 (고치지 않음) |
 | venv, 모델 | `~/marieum-ml/.venv`, `~/marieum-ml/models/...` | 같은 것을 읽기만 함 |
 | 로그 | journald | `~/exp-1031/server.log` |
 
 - GPU 메모리는 약 2GB 더 쓴다 (L4 23GB). GPU 칩은 같이 쓰므로, 실험 중 30초마다 8001 `/healthz`의 `sessions`를 기록해 운영 트래픽과 겹쳤는지 표시한다
-- 끝나면 8002 프로세스를 끄고 8001 `/healthz`가 ok인지 확인한다
+- **8002는 팀이 같이 쓰는 시험 포트다.** PR #3 작성자도 수정한 서버를 8002에 띄워 검증했다
+  - 시작 전에 8002가 비어 있는지 확인한다. 누가 쓰고 있으면 끄지 말고 그 사람에게 묻거나, 비어 있는 다른 포트(예: 8012)를 쓴다 (6절의 `PORT` 변수)
+  - 실험 시작과 끝을 팀 채널에 알린다
+  - 끌 때는 `pkill`을 쓰지 않는다. 띄울 때 저장한 PID(`server.pid`)로 **우리 프로세스만** 끈다
+- 끝나면 우리 프로세스를 끄고 8001 `/healthz`가 ok인지 확인한다
+- **서버 코드 버전:** PR #3이 운영에 반영되기 전 코드는 VAD 모델을 미리 1개, 반영 후 코드는 4개 만든다. 동시 4세션에서 세션 시작 지연이 조금 다를 수 있고, 인식 정확도와 신뢰도에는 영향이 거의 없다. 복사한 코드의 sha256과 VAD 미리 만들기 개수를 `server_sha.txt`에 남기고 보고서에 적는다
 - **데이터:** AI Hub 오디오·전사는 재배포 금지다. 저장소에는 `raw/`(wav, `라벨링데이터/`)와 `data/`가 올라가지 않는다(`.gitignore`). GPU 서버에는 변환한 오디오만 올리고 정답 전사는 올리지 않는다
 
 ## 4. 데이터 (22명, 약 300분)
@@ -148,23 +153,30 @@ SSH가 끊겨도 계속 돌도록 `tmux` 안에서 실행한다.
 # 로컬 → GPU 서버
 scp -r 1031_test_model_confidence/scripts 1031_test_model_confidence/data/audio16k 1031_test_model_confidence/data/parts.json ncloud@10.1.2.11:~/exp-1031/
 
-# GPU 서버: 운영 코드를 복사하고 기록
-cp -r ~/marieum-ml/server ~/exp-1031/
-sha256sum ~/exp-1031/server/*.py > ~/exp-1031/server_sha.txt
+# GPU 서버: 운영 코드를 복사하고 버전 기록 (PR #3 반영 여부 = VAD 미리 만들기 1개/4개)
+cd ~/exp-1031
+cp -r ~/marieum-ml/server .
+sha256sum server/*.py > server_sha.txt
+if grep -q "vads.free.extend" server/app.py; then echo "vad_preload=4 (PR #3 반영)"; else echo "vad_preload=1 (PR #3 이전)"; fi | tee -a server_sha.txt
 curl -s localhost:8001/healthz; nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 
-# GPU 서버: 실험 서버 (127.0.0.1만)
-cd ~/exp-1031
+# GPU 서버: 포트가 비어 있는지 확인. 무언가 나오면 끄지 말고 주인에게 묻거나 PORT를 바꾼다
+PORT=8002
+ss -ltnp | grep ":$PORT " || echo "$PORT free"
+
+# GPU 서버: 실험 서버 (127.0.0.1만). PID를 저장해 두고 끌 때 이것만 끈다
 ML_MODEL_DIR=$HOME/marieum-ml/models/ASR_Whisper_Disease_General \
-  nohup ~/marieum-ml/.venv/bin/uvicorn server.app:app --host 127.0.0.1 --port 8002 --workers 1 > server.log 2>&1 &
-until curl -sf localhost:8002/healthz; do sleep 2; done
+  nohup ~/marieum-ml/.venv/bin/uvicorn server.app:app --host 127.0.0.1 --port $PORT --workers 1 > server.log 2>&1 &
+echo $! > server.pid
+until curl -sf localhost:$PORT/healthz; do sleep 2; done
 
 # GPU 서버: 전송 (약 75~80분)
-~/marieum-ml/.venv/bin/python scripts/run_conversation.py --url ws://127.0.0.1:8002/asr-stream \
+~/marieum-ml/.venv/bin/python scripts/run_conversation.py --url ws://127.0.0.1:$PORT/asr-stream \
   --parts parts.json --out results --sessions 4
 
-# GPU 서버: 정리
-pkill -f "uvicorn server.app:app --host 127.0.0.1 --port 8002"
+# GPU 서버: 정리 (pkill 금지: 같은 포트를 쓰는 팀원 프로세스까지 끌 수 있음)
+kill "$(cat server.pid)"
+ss -ltnp | grep ":$PORT " || echo "$PORT closed"
 curl -s localhost:8001/healthz
 
 # GPU 서버 → 로컬
@@ -185,7 +197,7 @@ scp -r "ncloud@10.1.2.11:~/exp-1031/{results,server.log,server_sha.txt}" 1031_te
    - 말했는데 결과가 빈 구간 (`vad_skip`이나 `no_speech_prob > 0.6`에 막힌 경우)
    - 정답 없는 구간(기침, 숨, HMS 안내원 목소리, 라벨 밖 구간)의 출력과 신뢰도
    - interim의 `stable_text`가 final에서 바뀐 비율
-8. **지연 시간:** interim p50·p95(클라이언트), 구간 final `latency_ms` p50·p95(서버 로그). HANDOFF §7의 conversation 실제 발화 4세션(interim 117 / 132ms)과 비교. 8001에 운영 세션이 있던 시간은 따로 표시
+8. **지연 시간:** interim p50·p95(클라이언트), 구간 final `latency_ms` p50·p95(서버 로그). HANDOFF §7의 conversation 실제 발화 4세션(interim 117 / 132ms)과 비교. 8001에 운영 세션이 있던 시간은 따로 표시. 서버 코드 버전(`server_sha.txt`의 `vad_preload`)을 적고, 세션 첫 interim은 VAD 준비 지연이 섞일 수 있어 따로 본다
 9. **한계**
    - 26은 학습 파일이라 상한선 참고용이다
    - 구간별 정답은 정렬로 추정한 것이다. 정렬이 틀리면 경계 근처 오류율이 실제보다 나쁘게 나온다
@@ -196,6 +208,7 @@ scp -r "ncloud@10.1.2.11:~/exp-1031/{results,server.log,server_sha.txt}" 1031_te
    - 녹음은 대본을 읽는 검사 상황이라 실제 대화와 쉼 패턴이 다를 수 있다
    - 대본(02-01, 02-03, 04)은 모든 화자가 같아서, 모델이 대본 문장을 알고 있을 수 있다
    - 8002는 운영 8001과 GPU 칩을 같이 쓴다
+   - 서버 코드는 실험 당시 운영 코드를 복사한 것이다. PR #3 반영 전후로 세션 시작 지연이 조금 다를 수 있다
 
 ## 8. 다음 단계
 
