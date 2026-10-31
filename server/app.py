@@ -1,4 +1,4 @@
-"""ML 서버: WebSocket /asr-stream + /healthz + /livez (CALIBRATION.md §0).
+"""ML 서버: WebSocket /asr-stream + POST /asr + /healthz + /livez (CALIBRATION.md §0).
 
 실행 (워커 1개 고정, §8):
   ML_MODEL_DIR=models/ASR_Whisper_Disease_General \
@@ -8,19 +8,21 @@
 import asyncio
 import json
 import os
+import io
 import re
 import time
+import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .config import settings as S
-from .stream import CONVERSATION, MODES, SR, UTTERANCE, Agreement, Segmenter
+from .stream import CONVERSATION, MODES, SR, UTTERANCE, Agreement, Segmenter, word_delta
 
 ENDPOINT = "/asr-stream"
 TRACE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
@@ -160,6 +162,7 @@ class Session:
         self.seg = Segmenter(mode, make_vad(vad_model), S)
         self.agree = Agreement()
         self.agree_seg = 0
+        self.sent_words = {}  # 구간(segment_id)별로 stable_delta로 이미 내려보낸 단어
         self.odd = b""  # 홀수 바이트 프레임의 남은 1바이트
         self.bytes_total = 0
         self.t_start = time.perf_counter()
@@ -252,19 +255,28 @@ class Session:
                 self.agree, self.agree_seg = Agreement(), snap.seg_id
             text = "" if self.silenced(r) else r["text"][:MAX_TEXT]
             stable, unstable = self.agree.update(text)
+            delta, revised = self.take_delta(snap.seg_id, stable)
             self.interim_count += 1
             self.last_interim_sent = time.perf_counter()
             latency = (time.perf_counter() - self.arrival(snap.audio_end_ms)) * 1000
             await self.conn.send(self, {
                 "type": "transcript_interim", "text": " ".join(t for t in (stable, unstable) if t),
                 "confidence": r["confidence"], "is_final": False, "segment_id": snap.seg_id,
-                "stable_text": stable, "unstable_text": unstable, "audio_end_ms": snap.audio_end_ms})
+                "stable_text": stable, "unstable_text": unstable, "audio_end_ms": snap.audio_end_ms,
+                "stable_delta": delta, "stable_revised": revised})
             log("transcript_interim", self.trace_id, status="ok", latency_ms=round(latency),
                 confidence=r["confidence"], segment_id=snap.seg_id, interim_index=self.interim_count,
                 audio_ms=len(snap.audio) * 1000 // SR, queue_ms=round(r["queue_ms"]),
                 gpu_ms=round(r["gpu_ms"]), batch=r["batch"], batch_kinds=r["kinds"],
                 gen_tokens=r["gen_tokens"], no_speech_prob=r["no_speech_prob"])
         self.maybe_interim()
+
+    def take_delta(self, seg_id, text):
+        """확정된 단어 중 아직 안 내려보낸 것만 (단어 단위 스트리밍용). 보낸 단어로 기록한다."""
+        sent = self.sent_words.setdefault(seg_id, [])
+        words, revised = word_delta(sent, text)
+        self.sent_words[seg_id] = text.split() if revised else sent + words
+        return " ".join(words), revised
 
     @staticmethod
     def silenced(r):
@@ -304,10 +316,13 @@ class Session:
         else:
             text = "" if self.silenced(r) else r["text"][:MAX_TEXT]
             conf, nsp = (r["confidence"] if text else 0.0), r["no_speech_prob"]
+        delta, revised = self.take_delta(seg.seg_id, text)
+        self.sent_words.pop(seg.seg_id, None)
         await self.conn.send(self, {
             "type": "transcript_final", "text": text, "confidence": conf,
             "duration_ms": seg.duration_ms, "model_version": S.model_version, "no_speech_prob": nsp,
-            "segment_id": seg.seg_id, "is_last": is_last})
+            "segment_id": seg.seg_id, "is_last": is_last,
+            "stable_delta": delta, "stable_revised": revised})
         extra = {} if r is None else {"queue_ms": round(r["queue_ms"]), "gpu_ms": round(r["gpu_ms"]),
                                        "batch": r["batch"], "batch_kinds": r["kinds"],
                                        "gen_tokens": r["gen_tokens"], "ended_eot": r["ended_eot"]}
@@ -477,3 +492,109 @@ async def start_session(conn, p, trace):
     conn.current = s
     conn.warned_no_session = conn.mute_orphan_audio = False
     log("start", trace, status="ok", patient_id=s.patient_id, mode=mode, sample_rate=sr)
+
+
+# ---- POST /asr: 녹음 파일 한 번에 전사 --------------------------------------
+class AsrInputError(Exception):
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+def decode_upload(body, sample_rate):
+    """WAV(PCM 8/16/24/32비트, 채널 수 무관) 또는 PCM16 LE 모노(sample_rate 쿼리 필요) → 16kHz float32 모노."""
+    if body[:4] == b"RIFF":
+        try:
+            with wave.open(io.BytesIO(body)) as w:
+                sr, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+                raw = w.readframes(w.getnframes())
+        except (wave.Error, EOFError) as e:
+            raise AsrInputError(415, "INVALID_FORMAT", f"PCM WAV만 지원합니다 ({e}).") from None
+        if width == 3:  # 24비트 → 32비트로 늘려서 읽는다
+            b = np.frombuffer(raw[: len(raw) // 3 * 3], np.uint8).reshape(-1, 3)
+            raw = np.concatenate([np.zeros((len(b), 1), np.uint8), b], axis=1).tobytes()
+            width = 4
+        dtype = {1: np.uint8, 2: "<i2", 4: "<i4"}.get(width)
+        if dtype is None:
+            raise AsrInputError(415, "INVALID_FORMAT", f"지원하지 않는 WAV 샘플 크기: {width}바이트")
+        x = np.frombuffer(raw[: len(raw) // (width * ch) * width * ch], dtype).astype(np.float32)
+        x = (x - 128) / 128 if width == 1 else x / float(2 ** (8 * width - 1))
+        x = x.reshape(-1, ch).mean(axis=1) if ch > 1 else x
+    elif sample_rate is not None:
+        sr = sample_rate
+        x = np.frombuffer(body[: len(body) // 2 * 2], "<i2").astype(np.float32) / 32768.0
+    else:
+        raise AsrInputError(415, "INVALID_FORMAT",
+                            "WAV 파일을 보내거나, PCM16 LE 모노 바이트와 ?sample_rate=를 함께 보내세요.")
+    if not 8000 <= sr <= 48000:
+        raise AsrInputError(400, "INVALID_FORMAT", "sample_rate는 8000–48000이어야 합니다.")
+    if len(x) / sr > S.asr_max_s:
+        raise AsrInputError(413, "AUDIO_TOO_LONG", f"음성은 {S.asr_max_s:g}초까지 받습니다.")
+    if sr != SR and len(x):
+        import torch
+        import torchaudio
+        x = torchaudio.functional.resample(torch.from_numpy(np.ascontiguousarray(x)), sr, SR).numpy()
+    return x
+
+
+def split_speech(x, vad_model):
+    """대화 모드와 같은 기준(끝 무음, 구간 상한)으로 말소리 구간을 나눈다. 말소리 없는 구간은 버린다."""
+    seg = Segmenter(CONVERSATION, make_vad(vad_model), S)
+    segs = seg.feed(x)
+    last = seg.finish()
+    return [g for g in segs + ([last] if last else []) if g.has_speech]
+
+
+def asr_error(status, code, message, trace):
+    log("error", trace, endpoint="/asr", status="error", code=code, message=message)
+    return JSONResponse({"code": code, "message": message, "trace_id": trace}, status_code=status)
+
+
+@app.post("/asr")
+async def asr(request: Request, sample_rate: int | None = None, trace_id: str | None = None):
+    """녹음 파일을 한 번에 전사한다. 본문은 WAV 그대로(audio/wav) 또는 PCM16 LE 모노 + ?sample_rate=."""
+    trace = trace_id or request.headers.get("x-trace-id") or str(uuid.uuid4())
+    if not TRACE_RE.fullmatch(trace):
+        return asr_error(400, "INVALID_FORMAT", "trace_id는 영문·숫자·_- 64자 이내여야 합니다.", "unbound")
+    if state["status"] != "ok":
+        return asr_error(503, "MODEL_UNAVAILABLE", "모델 로딩 중입니다. 잠시 후 다시 시도하세요.", trace)
+    max_bytes = int(S.asr_max_s * 48000 * 2 * 4) + 1024  # 48kHz 스테레오 32비트 WAV 기준
+    if int(request.headers.get("content-length") or 0) > max_bytes:
+        return asr_error(413, "AUDIO_TOO_LONG", f"음성은 {S.asr_max_s:g}초까지 받습니다.", trace)
+    body = await request.body()
+    if not body:
+        return asr_error(400, "INVALID_FORMAT", "본문에 음성이 없습니다.", trace)
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    try:
+        x = await loop.run_in_executor(None, decode_upload, body, sample_rate)
+    except AsrInputError as e:
+        return asr_error(e.status, e.code, e.message, trace)
+
+    try:
+        vad_model = await loop.run_in_executor(vad_pool, vads.acquire)
+        try:
+            # 기본 스레드풀에서 돌린다: 긴 파일의 VAD가 스트리밍 세션용 vad_pool을 막지 않게
+            segs = await loop.run_in_executor(None, split_speech, x, vad_model)
+        finally:
+            vads.release(vad_model)
+        sch = state["scheduler"]
+        results = await asyncio.gather(*(sch.submit_final(f"http:{trace}:{g.seg_id}", g.audio) for g in segs))
+    except Exception as e:  # noqa: BLE001
+        log("asr_failed", trace, endpoint="/asr", status="error", message=repr(e))
+        return asr_error(500, "INTERNAL", "전사 중 서버 오류가 발생했습니다.", trace)
+
+    out = []
+    for g, r in zip(segs, results):
+        text = "" if Session.silenced(r) else r["text"][:MAX_TEXT]
+        if text:
+            out.append({"text": text, "confidence": r["confidence"],
+                        "start_ms": g.end_ms - g.duration_ms, "end_ms": g.end_ms})
+    total = sum(o["end_ms"] - o["start_ms"] for o in out)
+    conf = round(sum(o["confidence"] * (o["end_ms"] - o["start_ms"]) for o in out) / total, 4) if total else 0.0
+    body = {"trace_id": trace, "text": " ".join(o["text"] for o in out)[:MAX_TEXT], "confidence": conf,
+            "duration_ms": len(x) * 1000 // SR, "model_version": S.model_version, "segments": out}
+    log("transcript_file", trace, endpoint="/asr", status="ok",
+        latency_ms=round((time.perf_counter() - t0) * 1000), confidence=conf,
+        duration_ms=body["duration_ms"], segments=len(segs), text_segments=len(out))
+    return body

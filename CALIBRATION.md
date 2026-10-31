@@ -23,7 +23,7 @@
 | 워밍업 | 안 함 (#34) | 시작 시 batch 1–4로 한 번씩 (약 1.5초), 끝나야 `/healthz` 200 | 첫 추론 856ms. interim 목표 300ms |
 | `no_speech_prob` | 뺌 (#16) | final에 넣음 (프로토콜 필수). `<|startoftranscript|>` 다음 자리의 `<|nocaptions|>` 확률 (openai/whisper 정의). VAD가 말소리를 못 찾아 Whisper를 건너뛰면 1.0 | 프로토콜 v1.0 |
 | 무음 판정 | VAD만 | VAD + `no_speech_prob > 0.6`이면 빈 전사 | §0.5 환각 실측 |
-| 길이 | 업로드 20초 | `utterance` 10초 (넘으면 `AUDIO_TOO_LONG` + 자동 final). `conversation` 구간 최대 6초, 세션 600초 | 프로토콜 v1.0, §0.5 |
+| 길이 | 업로드 20초 | `utterance` 10초 (넘으면 `AUDIO_TOO_LONG` + 자동 final). `conversation` 구간 최대 15초, 세션 600초 | 프로토콜 v1.0, §0.5 |
 | 입력 | WAV 파일 | raw PCM16 little-endian 모노, 8–48kHz (16kHz 권장), 100ms 프레임. **Opus는 받지 않음** (`INVALID_FORMAT`) | 프로토콜 열린 질문 1 → PCM16 제안 |
 | Mock 서버 | 백엔드 담당 | ML이 제공: `scripts/mock_asr_server.py` (포트 9001, 아래 추가 필드 포함) | 프로토콜 §8 |
 | 에러 | HTTP 상태 + `error_code` | `{"type":"error","code",...}`. 세션 하나의 형식 오류는 연결을 닫지 않음 (§0.6) | 프로토콜 §9 |
@@ -42,7 +42,7 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
 | | `is_last` | 세션의 마지막 final인지. utterance는 항상 `true` |
 
 - `text`는 `stable_text + " " + unstable_text`. v1.0의 "뒤 interim이 앞 interim을 교체" 규칙 그대로 쓸 수 있다
-- `conversation`: 쉼(800ms)이나 구간 최대 길이에서 구간 final(`is_last: false`)이 온다. `end`를 받으면 남은 구간을 닫고 `is_last: true` final을 보낸다 (남은 말소리가 없으면 `text: ""`)
+- `conversation`: 쉼(1750ms)이나 구간 최대 길이에서 구간 final(`is_last: false`)이 온다. `end`를 받으면 남은 구간을 닫고 `is_last: true` final을 보낸다 (남은 말소리가 없으면 `text: ""`)
 - 응답 순서 보장: 한 세션 안에서 final은 `segment_id` 순서대로 온다. 구간 final 뒤에 그 구간의 interim은 오지 않는다
 
 ### 0.3 interim 규칙
@@ -50,7 +50,7 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
 - 보내는 간격은 최소 300ms (프로토콜 §7.1). GPU가 밀렸다 풀려도 몰려 나가지 않는다 (부하 시험 최소 간격 408ms)
 - **확정 규칙 (LocalAgreement-2):** 연속한 두 interim이 같게 낸 앞 단어만 확정한다. 확정분은 늘기만 한다. 현재 가설의 마지막 단어는 확정하지 않는다 ("화장" → "화장실에")
 - final은 구간 전체를 다시 전사한 결과라 드물게 확정분과 다를 수 있다. 화면은 final로 바꾼다
-- 구간 나누기(`conversation`): Silero VAD, 세션마다 따로. 말소리가 150ms 미만이면 잡음으로 버린다. 6초에 닿으면 마지막 5초 안의 가장 늦은 쉼에서 자르고 나머지는 다음 구간으로 넘긴다
+- 구간 나누기(`conversation`): Silero VAD, 세션마다 따로. 말소리가 150ms 미만이면 잡음으로 버린다. 15초에 닿으면 마지막 5초 안의 가장 늦은 쉼에서 자르고 나머지는 다음 구간으로 넘긴다
 
 ### 0.4 설정 (환경변수, `server/config.py`)
 | 변수 | 기본값 | 의미 |
@@ -60,8 +60,8 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
 | `ML_BATCH_MAX` | 4 | GPU 한 번에 묶는 최대 건수 |
 | `ML_INTERIM_STEP_MS` / `ML_MIN_INTERIM_SPEECH_MS` | 500 / 300 | interim 간격 / 첫 interim까지 필요한 말소리 |
 | `ML_VAD_THRESHOLD`, `ML_SPEECH_PAD_MS`, `ML_MIN_SPEECH_MS` | 0.5, 200, 150 | §6 값 그대로 |
-| `ML_END_SILENCE_MS` | 800 | 대화 모드에서 구간을 닫는 쉼 |
-| `ML_UTTERANCE_MAX_S` / `ML_MAX_SEGMENT_S` / `ML_SESSION_MAX_S` | 10 / 6 / 600 | 길이 상한 |
+| `ML_END_SILENCE_MS` | 1750 | 대화 모드에서 구간을 닫는 쉼 |
+| `ML_UTTERANCE_MAX_S` / `ML_MAX_SEGMENT_S` / `ML_SESSION_MAX_S` | 10 / 15 / 600 | 길이 상한 |
 | `ML_INTERIM_MAX_NEW_TOKENS` / `ML_FINAL_MAX_NEW_TOKENS` | 96 / 128 | 생성 토큰 상한 |
 | `ML_NO_SPEECH_THRESHOLD` / `ML_LOGPROB_THRESHOLD` | 0.6 / 0.0 | 무음 판정 (0.0 = logprob 조건 끔) |
 | `ML_DEBUG_SAVE` | 0 | 1이면 `/tmp/asr-debug/{trace_id}.wav`, 30분 뒤 삭제. 심사장에서는 반드시 0 |
@@ -101,6 +101,8 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
 | conversation, `sample.wav` 실제 발화 90초 × 동시 4 | 117 / 132 / 187ms (80건) | — | 0 |
 | conversation, 쉼 없이 이어 붙인 말 60초 × 동시 4, 구간 최대 10초 | 561 / 851 / 986ms (384건) | 645 / 789ms | 0 |
 | 같은 조건, 구간 최대 6초 (3회) | 312–335 / 543–606 / 706–1010ms | 272–336 / 380–407ms | 0 |
+| 같은 조건, 구간 최대 18초, 끝 무음 2.5초 (2026-11-01) | 615 / 1353 / 2720ms | 684 / 769ms | 0 |
+| 같은 조건, **구간 최대 15초, 끝 무음 1.75초 (현재 기본값, 2026-11-01)** | 493 / 1132 / 2145ms | 593 / 676ms | 0 |
 
 - 프로토콜 SLO(interim p50 ≤ 300, p95 ≤ 500, final p95 ≤ 800ms): **utterance와 실제 발화 대화는 통과**. 쉼 없이 말하는 4명 동시는 interim이 약간 넘는다. 구음장애 발화는 문장 사이 쉼이 길어서(이 샘플은 약 10초) 실제로는 드물다
 - 쉼 없이 말할 때 서버 쪽 내역 (구간 10초): GPU 대기 p50 152 / p95 387ms, GPU 1회 p50 239 / p95 404ms, 평균 2.1건 묶음

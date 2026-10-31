@@ -32,7 +32,7 @@
 | 형식 | PCM16 little-endian, 16kHz, 모노, 헤더 없는 raw |
 | 프레임 | 100ms = 3,200 bytes (1,600샘플), WebSocket **바이너리** 프레임 |
 | 보내는 속도 | 실시간 (100ms마다 1프레임) |
-| 최대 길이 | `utterance` 10초 / `conversation` 구간 6초, 세션 600초 |
+| 최대 길이 | `utterance` 10초 / `conversation` 구간 15초, 세션 600초 |
 | 종료 메시지 | `{"type": "end", "trace_id": "<start와 같은 값>"}` (`trace_id` 필수) |
 
 `INVALID_FORMAT`이 나도 연결은 끊기지 않는다. 고쳐서 다시 `start`를 보내면 된다.
@@ -74,7 +74,7 @@
 | 모드 | final 개수 | `is_last` |
 |---|---|---|
 | **`utterance`** (기본, 버튼 누르고 한 문장) | **딱 1번** | 항상 `true`. 중간 final 없음 |
-| `conversation` (버튼 없이 계속 말하기) | 0.8초 쉴 때마다 1번 + `end` 뒤 1번 | 중간은 `false`, 마지막만 `true` |
+| `conversation` (버튼 없이 계속 말하기) | 1.75초 쉴 때마다 1번 + `end` 뒤 1번 | 중간은 `false`, 마지막만 `true` |
 
 - ⭐ 정확도 모드는 **`utterance`**, ⚡ 실시간 모드는 **`conversation`** 을 쓴다. 실시간 모드는 `is_last: false` 구간 final이 올 때마다 바로 TTS로 보낸다(bypass)
 - **"`is_last: true` final을 받으면 세션 끝"** 으로 처리하면 두 모드 모두 맞다

@@ -32,13 +32,17 @@ class Settings:
     vad_threshold: float = _f("ML_VAD_THRESHOLD", 0.5)
     speech_pad_ms: int = _i("ML_SPEECH_PAD_MS", 200)
     min_speech_ms: int = _i("ML_MIN_SPEECH_MS", 150)
-    end_silence_ms: int = _i("ML_END_SILENCE_MS", 800)
+    end_silence_ms: int = _i("ML_END_SILENCE_MS", 1750)
 
     # 길이
     utterance_max_s: float = _f("ML_UTTERANCE_MAX_S", 10.0)
-    # 대화 모드 구간 최대 길이. 쉼 없이 말하는 4세션에서 10초면 interim p95 851ms, 6초면 543ms (2026-10-31)
-    max_segment_s: float = _f("ML_MAX_SEGMENT_S", 6.0)
+    # 대화 모드 구간 최대 길이. 쉼 없이 말하는 4세션에서 10초면 interim p95 851ms, 6초면 543ms (2026-10-31).
+    # 문장이 너무 일찍 끊겨 끝 무음 1.75초와 함께 15초로 늘림 (2026-11-01). Whisper 창 30초 안.
+    # 18초는 4세션 연속 발화에서 interim p95 1353ms라 줄임
+    max_segment_s: float = _f("ML_MAX_SEGMENT_S", 15.0)
     session_max_s: float = _f("ML_SESSION_MAX_S", 600.0)
+    # POST /asr 파일 하나의 최대 길이. 긴 파일은 대화 모드처럼 쉼에서 나눠 각각 전사한다
+    asr_max_s: float = _f("ML_ASR_MAX_S", 60.0)
 
     # Whisper 무음 판정: no_speech_prob > 0.6 이고 avg_logprob <= logprob_threshold 이면 빈 전사.
     # openai/whisper 기본은 -1.0이지만 이 모델은 무음에서 확신 있게 지어낸다

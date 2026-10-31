@@ -158,7 +158,7 @@ def test_utterance_silence_skips_whisper(url):
 def test_conversation_final_per_pause(url):
     with connect(url) as ws:
         trace = start(ws, mode="conversation")
-        send_audio(ws, pcm(("tone", 1.0), ("sil", 1.2), ("tone", 1.0), ("sil", 0.2)))
+        send_audio(ws, pcm(("tone", 1.0), ("sil", 2.8), ("tone", 1.0), ("sil", 0.2)))
         time.sleep(0.3)
         ws.send(json.dumps({"type": "end", "trace_id": trace}))
         msgs = recv_until_last(ws)
@@ -235,3 +235,93 @@ def test_sessions_on_separate_connections_do_not_mix(url):
         fa, fb = recv_until_last(a)[-1], recv_until_last(b)[-1]
     assert fa["trace_id"] == ta and fb["trace_id"] == tb
     assert len(fb["text"].split()) > len(fa["text"].split())
+
+
+@pytest.mark.parametrize("mode", ["utterance", "conversation"])
+def test_stable_delta_streams_each_word_once(url, mode):
+    # 확정된 단어만 한 번씩 내려준다: interim들의 stable_delta + final의 stable_delta = final 문장
+    with connect(url) as ws:
+        trace = start(ws, mode=mode)
+        send_audio(ws, pcm(("tone", 3.0)))
+        time.sleep(0.6)
+        ws.send(json.dumps({"type": "end", "trace_id": trace}))
+        msgs = recv_until_last(ws)
+    deltas = [m["stable_delta"] for m in msgs if m["type"] == "transcript_interim"]
+    f = [m for m in msgs if m["type"] == "transcript_final"][0]
+    assert any(deltas), "말하는 도중 확정 단어가 나와야 한다"
+    assert all("stable_revised" in m for m in msgs if m["type"].startswith("transcript"))
+    assert not f["stable_revised"]
+    assert " ".join(d for d in deltas + [f["stable_delta"]] if d) == f["text"]
+    # 각 interim의 stable_delta를 이어 붙이면 그 시점의 stable_text
+    acc = []
+    for m in msgs:
+        if m["type"] == "transcript_interim":
+            acc += m["stable_delta"].split()
+            assert " ".join(acc) == m["stable_text"]
+
+
+# ---- POST /asr ------------------------------------------------------------
+def post_asr(url, body, query="", headers=None):
+    import urllib.error
+    import urllib.request
+
+    http = url.replace("ws://", "http://").replace("/asr-stream", "/asr")
+    req = urllib.request.Request(http + query, data=body, method="POST",
+                                 headers={"Content-Type": "application/octet-stream", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def wav_bytes(data, sr=SR, ch=1, width=2):
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(width)
+        w.setframerate(sr)
+        w.writeframes(data)
+    return buf.getvalue()
+
+
+def test_asr_wav_splits_on_pause(url):
+    status, r = post_asr(url, wav_bytes(pcm(("sil", 0.5), ("tone", 1.0), ("sil", 2.5), ("tone", 1.0), ("sil", 0.3))),
+                         headers={"X-Trace-Id": "file-1"})
+    assert status == 200, r
+    assert r["trace_id"] == "file-1" and len(r["segments"]) == 2
+    assert r["text"] == " ".join(s["text"] for s in r["segments"]) and r["confidence"] > 0
+    assert r["segments"][0]["start_ms"] < r["segments"][0]["end_ms"] <= r["segments"][1]["start_ms"]
+    assert abs(r["duration_ms"] - 5300) < 50
+
+
+def test_asr_stereo_24bit_wav(url):
+    # 스테레오·24비트도 받는다 (리샘플링은 torchaudio가 있는 GPU 서버에서 확인)
+    mono = np.frombuffer(pcm(("tone", 1.5)), "<i2").astype("<i4") << 16
+    b = mono.view(np.uint8).reshape(-1, 4)[:, 1:]  # 상위 3바이트 = 24비트 LE
+    stereo = np.repeat(b[:, None, :], 2, axis=1).tobytes()
+    status, r = post_asr(url, wav_bytes(stereo, ch=2, width=3))
+    assert status == 200 and r["text"] and abs(r["duration_ms"] - 1500) < 50
+
+
+def test_asr_raw_pcm_needs_sample_rate(url):
+    data = pcm(("tone", 1.0))
+    assert post_asr(url, data)[0] == 415
+    status, r = post_asr(url, data, "?sample_rate=16000&trace_id=raw-1")
+    assert status == 200 and r["text"] and r["trace_id"] == "raw-1"
+
+
+def test_asr_silence_is_empty(url):
+    status, r = post_asr(url, wav_bytes(pcm(("sil", 2.0))))
+    assert status == 200 and r["text"] == "" and r["segments"] == [] and r["confidence"] == 0.0
+
+
+def test_asr_errors(url):
+    assert post_asr(url, b"")[1]["code"] == "INVALID_FORMAT"
+    status, r = post_asr(url, wav_bytes(pcm(("tone", 61.0))))
+    assert (status, r["code"]) == (413, "AUDIO_TOO_LONG")
+    assert post_asr(url, pcm(("tone", 0.5)), "?sample_rate=4000")[0] == 400
+    assert post_asr(url, pcm(("tone", 0.5)), "?sample_rate=16000&trace_id=bad%20id")[0] == 400
