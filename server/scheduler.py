@@ -23,11 +23,11 @@ class Job:
     created: float = field(default_factory=time.perf_counter)
 
 
-def token_cap(hard, vad_speech_ms, rate, floor):
-    """작업 하나의 출력 토큰 상한 (MAX_NEW_TOKENS.md §3)."""
+def token_cap(hard, audio_ms, rate, floor):
+    """작업 하나의 출력 토큰 상한 (MAX_NEW_TOKENS.md §3). audio_ms는 Whisper에 넣는 음성 길이."""
     if rate <= 0:
         return hard
-    return min(hard, math.ceil(vad_speech_ms * rate / 1000) + floor)
+    return min(hard, math.ceil(audio_ms * rate / 1000) + floor)
 
 
 class GpuScheduler:
@@ -51,22 +51,22 @@ class GpuScheduler:
             self.task.cancel()
         self.pool.shutdown(wait=False, cancel_futures=True)
 
-    def _job(self, key, kind, audio, vad_speech_ms):
-        cap = token_cap(self.max_new[kind], vad_speech_ms, self.cap_rate, self.cap_floor)
+    def _job(self, key, kind, audio, audio_ms):
+        cap = token_cap(self.max_new[kind], audio_ms, self.cap_rate, self.cap_floor)
         job = Job(key, kind, audio, cap, asyncio.get_running_loop().create_future())
         self.wake.set()
         return job
 
-    def submit_final(self, key, audio, vad_speech_ms):
-        job = self._job(key, "final", audio, vad_speech_ms)
+    def submit_final(self, key, audio, audio_ms):
+        job = self._job(key, "final", audio, audio_ms)
         self.finals.append(job)
         return job.future
 
-    def submit_interim(self, key, audio, vad_speech_ms):
+    def submit_interim(self, key, audio, audio_ms):
         old = self.interims.pop(key, None)
         if old is not None:
             old.future.cancel()
-        job = self._job(key, "interim", audio, vad_speech_ms)
+        job = self._job(key, "interim", audio, audio_ms)
         self.interims[key] = job
         return job.future
 

@@ -239,7 +239,7 @@ class Session:
             return
         snap = self.seg.snapshot()
         self.interim_inflight = True
-        fut = state["scheduler"].submit_interim(self.key, snap.audio, snap.vad_speech_ms)
+        fut = state["scheduler"].submit_interim(self.key, snap.audio, len(snap.audio) * 1000 // SR)
         asyncio.create_task(self._interim(snap, fut))
 
     async def _interim(self, snap, fut):
@@ -290,7 +290,7 @@ class Session:
         t_close = time.perf_counter()
         sch = state["scheduler"]
         sch.cancel_interim(self.key)
-        fut = sch.submit_final(self.key, seg.audio, seg.vad_speech_ms) if seg.has_speech else None
+        fut = sch.submit_final(self.key, seg.audio, len(seg.audio) * 1000 // SR) if seg.has_speech else None
         prev = self.last_final
         self.last_final = asyncio.create_task(self._final(seg, fut, prev, is_last, t_close))
         if is_last:
@@ -582,7 +582,7 @@ async def asr(request: Request, sample_rate: int | None = None, trace_id: str | 
         finally:
             vads.release(vad_model)
         sch = state["scheduler"]
-        results = await asyncio.gather(*(sch.submit_final(f"http:{trace}:{g.seg_id}", g.audio, g.vad_speech_ms)
+        results = await asyncio.gather(*(sch.submit_final(f"http:{trace}:{g.seg_id}", g.audio, len(g.audio) * 1000 // SR)
                                          for g in segs))
     except Exception as e:  # noqa: BLE001
         log("asr_failed", trace, endpoint="/asr", status="error", message=repr(e))
@@ -592,7 +592,7 @@ async def asr(request: Request, sample_rate: int | None = None, trace_id: str | 
     for g, r in zip(segs, results):
         log("transcript_file_segment", trace, endpoint="/asr", status="ok", segment_id=g.seg_id,
             gen_tokens=r["gen_tokens"], ended_eot=r["ended_eot"], token_cap=r["token_cap"],
-            vad_speech_ms=g.vad_speech_ms)
+            speech_ms=len(g.audio) * 1000 // SR, vad_speech_ms=g.vad_speech_ms)
         text = "" if Session.silenced(r) else r["text"][:MAX_TEXT]
         if text:
             out.append({"text": text, "confidence": r["confidence"],

@@ -148,16 +148,26 @@ def test_utterance_interims_then_one_final(url):
     assert all(b.startswith(a) for a, b in zip(stables, stables[1:]))
 
 
-def test_final_token_cap_follows_speech_length(url):
-    # 말소리 약 1초 (VAD 창 31–32개) → ceil(0.992–1.024초 × 14) + 8
+def final_cap(url, audio):
     eng = app_mod.state["scheduler"].engine
     eng.caps.clear()
     with connect(url) as ws:
         trace = start(ws)
-        send_audio(ws, pcm(("tone", 1.0), ("sil", 0.5)))
+        send_audio(ws, audio)
         ws.send(json.dumps({"type": "end", "trace_id": trace}))
         recv_until_last(ws)
-    assert eng.caps[-1] in (22, 23)
+    return eng.caps[-1]
+
+
+def test_final_token_cap_follows_speech_length(url):
+    # 말소리 창 0–31 + 뒤 여유 6창 = 38창 1216ms → ceil(17.02) + 8 = 26. 31번(소리 128샘플)이 빠지면 1184ms → 25
+    assert final_cap(url, pcm(("tone", 1.0), ("sil", 0.5))) in (25, 26)
+
+
+def test_final_token_cap_counts_pause_inside_segment(url):
+    # 창 0–99(말소리 끝 93 + 여유 6, 중간 쉼 1초 포함) = 3200ms → ceil(44.8) + 8 = 53. 93번이 빠져도 3168ms → 53
+    # VAD 말소리 시간(64창 2048ms)으로 셌다면 37
+    assert final_cap(url, pcm(("tone", 1.0), ("sil", 1.0), ("tone", 1.0), ("sil", 0.5))) == 53
 
 
 def test_utterance_silence_skips_whisper(url):

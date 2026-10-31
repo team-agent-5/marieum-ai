@@ -34,7 +34,7 @@ class Segment:
     duration_ms: int  # 자르기 전 구간 길이
     end_ms: int  # 세션 시작 기준 구간 끝 위치
     reason: str  # silence | max_length | end | too_long
-    vad_speech_ms: int  # VAD 말소리 창 수 × 32ms. 구간 중간 쉼은 빠진다 (출력 토큰 상한 계산용)
+    vad_speech_ms: int  # VAD 말소리 창 수 × 32ms. 구간 중간 쉼은 빠진다 (로그용. 상한 R 재측정에 쓴다)
 
 
 @dataclass

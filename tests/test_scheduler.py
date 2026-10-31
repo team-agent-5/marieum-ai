@@ -18,7 +18,7 @@ class RecordingEngine:
 
 
 def run_one_batch(jobs, rate=14.0, floor=8):
-    """jobs: [(kind, vad_speech_ms)]. 작업자가 돌기 전에 모두 넣어 한 묶음으로 돌린다."""
+    """jobs: [(kind, audio_ms)]. 작업자가 돌기 전에 모두 넣어 한 묶음으로 돌린다."""
     eng = RecordingEngine()
 
     async def go():
