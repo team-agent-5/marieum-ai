@@ -58,7 +58,7 @@ def test_utterance_too_long_closes_session():
 
 def test_conversation_splits_on_pause():
     seg = Segmenter(CONVERSATION, fake_vad, CFG)
-    audio = np.concatenate([silence(0.5), tone(1.5), silence(1.5), tone(1.0), silence(0.3)])
+    audio = np.concatenate([silence(0.5), tone(1.5), silence(2.8), tone(1.0), silence(0.3)])
     closed = feed_frames(seg, audio)
     assert [c.reason for c in closed] == ["silence"]
     assert closed[0].seg_id == 0 and closed[0].has_speech
@@ -67,9 +67,9 @@ def test_conversation_splits_on_pause():
 
 
 def test_conversation_pause_inside_sentence_is_kept():
-    # 800ms보다 짧은 쉼은 문장을 끊지 않는다 (구음장애 발화는 중간 쉼이 길다)
+    # 1.75초보다 짧은 쉼은 문장을 끊지 않는다 (구음장애 발화는 중간 쉼이 길다)
     seg = Segmenter(CONVERSATION, fake_vad, CFG)
-    closed = feed_frames(seg, np.concatenate([tone(1.0), silence(0.6), tone(1.0)]))
+    closed = feed_frames(seg, np.concatenate([tone(1.0), silence(1.5), tone(1.0)]))
     assert closed == []
     assert seg.finish().seg_id == 0
 
@@ -110,10 +110,10 @@ def test_interim_cadence_and_snapshot():
 
 
 def test_conversation_default_max_segment_hard_cut():
-    seg = Segmenter(CONVERSATION, fake_vad, CFG)  # 6초, 쉼 없음 → 그 자리에서 자른다
-    closed = feed_frames(seg, tone(13.0))
+    seg = Segmenter(CONVERSATION, fake_vad, CFG)  # 15초, 쉼 없음 → 그 자리에서 자른다
+    closed = feed_frames(seg, tone(31.0))
     assert [c.reason for c in closed] == ["max_length", "max_length"]
-    assert all(5.9 < c.duration_ms / 1000 < 6.1 for c in closed)
+    assert all(14.9 < c.duration_ms / 1000 < 15.1 for c in closed)
     assert seg.finish().has_speech
 
 
@@ -132,3 +132,13 @@ def test_agreement_ignores_punctuation():
     a = Agreement()
     a.update("물 주세요.")
     assert a.update("물 주세요, 지금")[0] == "물 주세요,"
+
+
+def test_word_delta():
+    from server.stream import word_delta
+    assert word_delta([], "물") == (["물"], False)
+    assert word_delta(["물"], "물 좀") == (["좀"], False)
+    assert word_delta(["물", "좀"], "물 좀") == ([], False)
+    assert word_delta(["물", "좀"], "물 좀 주세요.") == (["주세요."], False)
+    assert word_delta(["물", "좀"], "물, 좀 주세요") == (["주세요"], False)  # 구두점 무시
+    assert word_delta(["믈"], "물 좀 주세요") == (["물", "좀", "주세요"], True)  # 앞에서 보낸 단어가 바뀜

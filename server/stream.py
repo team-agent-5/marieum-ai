@@ -255,3 +255,16 @@ class Agreement:
         n = len(self.committed)
         tail = words[n:] if len(words) > n else []
         return " ".join(self.committed), " ".join(tail)
+
+
+def word_delta(sent, text):
+    """이미 내려보낸 단어(sent) 뒤로 새로 붙은 단어만 돌려준다: (새 단어 목록, revised).
+
+    text가 sent로 시작하지 않으면(앞에서 보낸 단어와 달라졌으면) text 전체와 revised=True.
+    구두점은 무시하고 비교한다 ("주세요"와 "주세요."는 같다).
+    """
+    words = text.split()
+    n = len(sent)
+    if [_norm(w) for w in words[:n]] == [_norm(w) for w in sent]:
+        return words[n:], False
+    return words, True
