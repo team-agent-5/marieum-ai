@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -17,15 +18,24 @@ class Job:
     key: str  # 세션 키
     kind: str  # interim | final
     audio: object
+    cap: int  # 이 작업의 출력 토큰 상한
     future: asyncio.Future
     created: float = field(default_factory=time.perf_counter)
 
 
+def token_cap(hard, audio_ms, rate, floor):
+    """작업 하나의 출력 토큰 상한 (MAX_NEW_TOKENS.md §3). audio_ms는 Whisper에 넣는 음성 길이."""
+    if rate <= 0:
+        return hard
+    return min(hard, math.ceil(audio_ms * rate / 1000) + floor)
+
+
 class GpuScheduler:
-    def __init__(self, engine, batch_max, interim_max_new_tokens, final_max_new_tokens):
+    def __init__(self, engine, batch_max, interim_max_new_tokens, final_max_new_tokens, cap_rate, cap_floor):
         self.engine = engine
         self.batch_max = batch_max
         self.max_new = {"interim": interim_max_new_tokens, "final": final_max_new_tokens}
+        self.cap_rate, self.cap_floor = cap_rate, cap_floor
         self.finals = []
         self.interims = {}  # key -> Job (도착 순서 유지)
         self.wake = asyncio.Event()
@@ -41,21 +51,22 @@ class GpuScheduler:
             self.task.cancel()
         self.pool.shutdown(wait=False, cancel_futures=True)
 
-    def _job(self, key, kind, audio):
-        job = Job(key, kind, audio, asyncio.get_running_loop().create_future())
+    def _job(self, key, kind, audio, audio_ms):
+        cap = token_cap(self.max_new[kind], audio_ms, self.cap_rate, self.cap_floor)
+        job = Job(key, kind, audio, cap, asyncio.get_running_loop().create_future())
         self.wake.set()
         return job
 
-    def submit_final(self, key, audio):
-        job = self._job(key, "final", audio)
+    def submit_final(self, key, audio, audio_ms):
+        job = self._job(key, "final", audio, audio_ms)
         self.finals.append(job)
         return job.future
 
-    def submit_interim(self, key, audio):
+    def submit_interim(self, key, audio, audio_ms):
         old = self.interims.pop(key, None)
         if old is not None:
             old.future.cancel()
-        job = self._job(key, "interim", audio)
+        job = self._job(key, "interim", audio, audio_ms)
         self.interims[key] = job
         return job.future
 
@@ -86,11 +97,10 @@ class GpuScheduler:
             batch = self._take()
             if not batch:
                 continue
-            max_new = max(self.max_new[j.kind] for j in batch)
             started = time.perf_counter()
             try:
                 results, timing = await loop.run_in_executor(
-                    self.pool, self.engine.transcribe, [j.audio for j in batch], max_new)
+                    self.pool, self.engine.transcribe, [j.audio for j in batch], [j.cap for j in batch])
             except Exception as e:  # noqa: BLE001 - 작업자는 죽지 않고 해당 작업만 실패시킨다
                 for j in batch:
                     if not j.future.done():
@@ -99,5 +109,6 @@ class GpuScheduler:
             self.busy_s += time.perf_counter() - started
             for j, r in zip(batch, results):
                 if not j.future.done():
-                    j.future.set_result({**r, **timing, "queue_ms": (started - j.created) * 1000,
+                    j.future.set_result({**r, **timing, "token_cap": j.cap,
+                                         "queue_ms": (started - j.created) * 1000,
                                          "kinds": "+".join(sorted(x.kind[0] for x in batch))})

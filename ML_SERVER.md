@@ -125,7 +125,7 @@ VAD 설정은 기존 캘리브레이션 값 그대로다: threshold 0.5, 앞뒤 
 - 작업자는 **1개**, 한 번에 **최대 4건을 묶어** 돌린다 (Whisper 입력은 어차피 30초로 채워지므로 묶기 쉽다).
 - **final이 먼저** (도착 순서대로), 남는 자리에 interim을 넣는다.
 - interim은 **세션마다 대기 1개**만 둔다. 새 interim이 오면 대기 중인 것을 버리고 바꿔 끼운다. GPU가 밀리면 interim 간격이 저절로 늘고, 대기열이 쌓이지 않는다.
-- 묶음의 토큰 상한은 묶인 작업 중 큰 값 (interim 96, final 128).
+- 토큰 상한은 작업마다 따로 정하고, 같은 묶음 안에서도 줄마다 자기 상한에서 멈춘다. `min(고정 상한, ceil(Whisper에 넣는 음성 길이(초) × 14) + 8)`, 고정 상한은 interim 96 / final 128 (`MAX_NEW_TOKENS.md`).
 - 추론 오류가 나면 그 묶음의 작업만 실패시키고 작업자는 계속 돈다 (final 실패 → `INTERNAL`).
 
 ### 5.4 Whisper 엔진 (`AsrEngine`, `server/engine.py`)
@@ -182,6 +182,7 @@ VAD 설정은 기존 캘리브레이션 값 그대로다: threshold 0.5, 앞뒤 
 | `ML_DTYPE` | `fp16` | `fp16` / `fp32` |
 | `ML_BATCH_MAX` | 4 | GPU 한 번에 묶는 최대 건수 |
 | `ML_INTERIM_MAX_NEW_TOKENS` / `ML_FINAL_MAX_NEW_TOKENS` | 96 / 128 | 생성 토큰 상한 |
+| `ML_TOKEN_CAP_RATE` / `ML_TOKEN_CAP_FLOOR` | 14 / 8 | 작업별 상한 = min(고정 상한, ceil(Whisper에 넣는 음성 길이(초) × rate) + floor). rate 0이면 고정 상한만 |
 | `ML_INTERIM_STEP_MS` | 500 | interim 다시 전사 간격 (오디오 기준) |
 | `ML_MIN_INTERIM_SPEECH_MS` | 300 | 첫 interim까지 필요한 말소리 |
 | `ML_VAD_THRESHOLD` | 0.5 | 말소리 판정 |
@@ -268,8 +269,9 @@ sudo iptables -S INPUT | grep marieum-ml       # 방화벽 규칙
 `/usr/local/sbin/marieum-ml-firewall.sh`의 `BACKEND_IP`를 고치고 (레포 `deploy/`도 같이) `sudo systemctl restart marieum-ml-firewall`
 
 ### 로그
-- 이벤트: `start`, `transcript_interim`, `transcript_final`, `session_closed`, `error`, `model_loaded`, `warmup_done`
+- 이벤트: `start`, `transcript_interim`, `transcript_final`, `transcript_file`, `transcript_file_segment`(POST /asr 구간별), `session_closed`, `error`, `model_loaded`, `warmup_done`
 - 공통 필드: `ts`, `trace_id`, `endpoint`, `event`, `model_version` + `latency_ms`, `queue_ms`, `gpu_ms`, `batch`, `segment_id`, `interim_index`, `audio_bytes_total`, `interim_count`, `vad_segments`
+- 토큰 상한 필드 (interim, final, `transcript_file_segment`): `gen_tokens`, `ended_eot`, `token_cap`(그 작업의 상한), `vad_speech_ms`(VAD 말소리 시간. 로그용이고 상한 계산에는 안 쓴다. 상한은 final `speech_ms`·interim `audio_ms` 기준)
 - **전사 텍스트는 로그에 남기지 않는다.** `patient_id`는 남긴다
 
 ---

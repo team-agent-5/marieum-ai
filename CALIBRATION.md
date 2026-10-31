@@ -63,6 +63,7 @@ v1.0 필드는 모두 그대로 보낸다. 추가 필드만 무시하면 v1.0 �
 | `ML_END_SILENCE_MS` | 1750 | 대화 모드에서 구간을 닫는 쉼 |
 | `ML_UTTERANCE_MAX_S` / `ML_MAX_SEGMENT_S` / `ML_SESSION_MAX_S` | 10 / 15 / 600 | 길이 상한 |
 | `ML_INTERIM_MAX_NEW_TOKENS` / `ML_FINAL_MAX_NEW_TOKENS` | 96 / 128 | 생성 토큰 상한 |
+| `ML_TOKEN_CAP_RATE` / `ML_TOKEN_CAP_FLOOR` | 14 / 8 | 작업별 상한 = min(고정 상한, ceil(Whisper에 넣는 음성 길이(초) × rate) + floor). rate 0이면 고정 상한만 (`MAX_NEW_TOKENS.md`) |
 | `ML_NO_SPEECH_THRESHOLD` / `ML_LOGPROB_THRESHOLD` | 0.6 / 0.0 | 무음 판정 (0.0 = logprob 조건 끔) |
 | `ML_DEBUG_SAVE` | 0 | 1이면 `/tmp/asr-debug/{trace_id}.wav`, 30분 뒤 삭제. 심사장에서는 반드시 0 |
 
