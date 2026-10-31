@@ -1,0 +1,16 @@
+# GPU 서버(inno-gpu-006)에서 검증한 버전 (CALIBRATION.md §4, §0). Python 3.11
+# torch/torchaudio는 CUDA 12.8 빌드:
+#   uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+transformers==4.53.3
+tokenizers==0.21.4
+huggingface-hub==0.36.2
+safetensors==0.8.0
+numpy==2.4.6
+silero-vad==6.2.3
+fastapi==0.120.4
+starlette==0.49.3
+uvicorn[standard]==0.54.0
+websockets==17.4
+pytest==9.2.0
