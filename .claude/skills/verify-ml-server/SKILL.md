@@ -166,4 +166,4 @@ GPU 서버에서 아직 한 번도 안 돌린 것 (첫 실행 때 확인하고 �
 - doctor의 `ss -ltnp` 포트 주인 확인 (PC에는 `ss`가 없어 SKIP)
 - Linux에서 `kill`로 uvicorn 종료
 - `compare_finals.py`가 실제로 다른 두 결과(기준선 vs 후보)를 가르는지 (PC에서는 같은 결과끼리만 비교)
-- `token_cap` 검사 전부 (상한 기능이 아직 없다)
+- 실제 모델의 `token_cap` 검사 (PC 가짜 엔진에서는 ML_TOKEN_CAP_RATE=1·FLOOR=0으로 모든 interim/final이 상한에 닿고 위반 0을 확인)
