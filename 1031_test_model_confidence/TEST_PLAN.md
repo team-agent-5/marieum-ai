@@ -109,12 +109,14 @@ GPU 서버(`inno-gpu-006`, NCP)의 운영 서비스는 건드리지 않는다.
 ### 5.2 서버 전송 (GPU 서버, `run_conversation.py`)
 
 - `ws://127.0.0.1:8002/asr-stream`, conversation 모드, 부분 1개 = 연결 1개 = 세션 1개
-- 100ms 프레임을 실제 속도로, 동시 4세션 (대기열에서 4개씩 꺼내 보냄)
-- `trace_id`는 `exp1031-<화자>-p<부분>`, `patient_id`는 `exp1031`
-- 받은 메시지를 **전부** 도착 시각과 함께 세션마다 jsonl로 저장한다 (interim, final, error)
-- 녹음 중 긴 쉼이 있을 수 있으므로 `stream_client.py`처럼 30초 무응답으로 끊지 않는다. `is_last: true` final을 받을 때까지 기다린다 (`end` 후 30초 넘으면 타임아웃 기록)
-- interim 지연은 `audio_end_ms`로 클라이언트에서 계산한다 (`stream_client.py`와 같은 방식)
-- 30초마다 `127.0.0.1:8001/healthz`의 `sessions`, `gpu_pending`을 `ops_8001.jsonl`에 기록한다
+- 100ms 프레임을 실제 속도로, 동시 4세션. 긴 부분부터 보내 전체 시간을 줄인다
+- `trace_id`는 `exp1031-<화자>-p<부분>-<실행ID>`(실행ID = 시작 시각 `MMDDhhmmss`), `patient_id`는 `exp1031`. 다시 실행해도 서버 로그에서 구분된다
+- 받은 메시지를 **전부** 도착 시각과 함께 부분마다 `results/<화자>_pNN.jsonl`에 받는 즉시 저장한다 (interim, final, error, `_meta`, `_end_sent`, `_summary`)
+- 녹음 안에 30~50초 쉼이 있으므로(`prepare.py` 실측) `stream_client.py`처럼 30초 무응답으로 끊지 않는다. `is_last: true` final을 받을 때까지 기다린다 (`end` 후 30초 넘으면 `end_timeout`으로 기록)
+- interim 지연(`lat_ms`)은 `audio_end_ms`로 클라이언트에서 계산한다 (`stream_client.py`와 같은 방식)
+- 30초마다 운영 `127.0.0.1:8001/healthz`와 실험 서버 `/healthz`의 `sessions`, `gpu_pending`, GPU 여유 메모리를 `results/ops.jsonl`에 기록한다. 실행 기록은 `results/runs.jsonl`
+- **중간에 멈추면:** 끝난 부분만 `.jsonl`이 되고, 실패하거나 끊긴 부분은 `.partial.jsonl`로 남는다. 같은 명령을 다시 실행하면 끝난 부분은 건너뛰고 나머지만 보낸다
+- 로컬 Mock 확인 (2026-10-31): 5명 6부분, 5배속에서 모두 성공. 이미 끝난 부분 건너뛰기, 서버가 꺼져 있을 때 시작 거부도 확인했다. Mock은 interim마다 0.15초 쉬어서 10배속을 넘기면 밀려 연결이 끊긴다 (실서버와 무관). `--speed`는 Mock 시험용이고 본 실험은 1배속
 
 ### 5.3 정답 붙이기와 분석 (로컬, `analyze.py`)
 
@@ -142,7 +144,8 @@ GPU 서버(`inno-gpu-006`, NCP)의 운영 서비스는 건드리지 않는다.
  "hyp": "…", "confidence": 0.97, "no_speech_prob": 0.0, "vad_skip": false,
  "ref_span": "…", "align": "global", "cer": 0.0, "mid_sentence_cut": false,
  "interim_count": 5, "interim_conf_first": 0.81, "interim_conf_last": 0.95, "interim_conf_min": 0.62,
- "stable_changed": false, "final_latency_ms": 180, "ops_8001_sessions": 0, "error": null}
+ "stable_changed": false, "final_latency_ms": 180, "ops_8001_sessions": 0, "error": null,
+ "trace_id": "exp1031-OTK-p01-1101093000"}
 ```
 
 ## 6. GPU 서버 실행 순서 (사용자가 직접)
@@ -170,7 +173,7 @@ ML_MODEL_DIR=$HOME/marieum-ml/models/ASR_Whisper_Disease_General \
 echo $! > server.pid
 until curl -sf localhost:$PORT/healthz; do sleep 2; done
 
-# GPU 서버: 전송 (약 75~80분)
+# GPU 서버: 전송 (약 75~80분). 마지막 줄이 "실패 0"인지 본다. 실패가 있으면 같은 명령을 다시 실행
 ~/marieum-ml/.venv/bin/python scripts/run_conversation.py --url ws://127.0.0.1:$PORT/asr-stream \
   --parts parts.json --out results --sessions 4
 
@@ -208,11 +211,12 @@ scp -r "ncloud@10.1.2.11:~/exp-1031/{results,server.log,server_sha.txt}" 1031_te
    - 녹음은 대본을 읽는 검사 상황이라 실제 대화와 쉼 패턴이 다를 수 있다
    - 대본(02-01, 02-03, 04)은 모든 화자가 같아서, 모델이 대본 문장을 알고 있을 수 있다
    - 8002는 운영 8001과 GPU 칩을 같이 쓴다
+   - LOS와 LGS는 녹음 소리가 아주 작다(최대 음량 0.038, 0.026). 백엔드와 같은 조건을 위해 키우지 않았으므로 VAD가 말소리를 놓쳐 빈 구간이 많을 수 있다. 많으면 음량을 키운 버전을 추가로 돌린다
    - 서버 코드는 실험 당시 운영 코드를 복사한 것이다. PR #3 반영 전후로 세션 시작 지연이 조금 다를 수 있다
 
 ## 8. 다음 단계
 
-1. 5.1 `prepare.py` 작성과 실행 (로컬)
-2. 5.2 `run_conversation.py` 작성. 로컬에서 Mock 서버(`scripts/mock_asr_server.py`, 9001)로 먼저 확인
+1. ~~5.1 `prepare.py` 작성과 실행 (로컬)~~ 완료: 42부분, 296.8분
+2. ~~5.2 `run_conversation.py` 작성, 로컬 Mock 확인~~ 완료
 3. GPU 서버 실행과 결과 회수는 사용자가 직접 (6절)
 4. 5.3 `analyze.py` 작성, 보고서 md 작성
