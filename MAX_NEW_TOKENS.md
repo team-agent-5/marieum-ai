@@ -1,6 +1,6 @@
 # max_new_tokens: 소리 길이에 비례하는 출력 상한
 
-2026-11-01 정리. 기준 코드는 main `d8c0c52` (PR #5: 끝 무음 1.75초, 구간 15초). 서버 코드는 아직 바꾸지 않았다 (제안 단계). 검증 절차: `.claude/skills/verify-ml-server/`.
+2026-11-01 정리. 기준 코드는 main `d8c0c52` (PR #5: 끝 무음 1.75초, 구간 15초). `feat/max-new-tokens` 브랜치에 구현했다 (GPU 서버 검증 전). 검증 절차: `.claude/skills/verify-ml-server/`.
 
 ## 0. 한 줄 요약
 
@@ -133,7 +133,7 @@ R=14일 때:
    - 스케줄러가 작업마다 `cap`을 계산해 엔진에 목록으로 넘긴다
    - `engine.py`의 `generate()`에 줄마다 따로 멈추는 `StoppingCriteria`를 넣는다 (줄별 True/False 텐서 반환)
    - `max_new_tokens`에는 묶음 최댓값을 넣어 전체 상한으로 쓴다
-2. **말소리 길이 전달**: `Segment`, `Snapshot`에 `speech_ms`를 추가한다. `Segmenter`가 이미 `speech_win`을 세고 있다.
+2. **말소리 길이 전달**: `Segment`, `Snapshot`에 `vad_speech_ms`를 추가한다. `Segmenter`가 이미 `speech_win`을 세고 있다.
 3. **R·floor는 환경변수로**: 다른 설정처럼 `ML_*`로 받으면 배포 후 재빌드 없이 조정할 수 있고, 검증 때 아주 작은 R로 띄워 상한이 줄마다 걸리는지 결정적으로 확인할 수 있다.
 4. **검증에 필요한 로그 필드** (검증 스킬 `features/token-cap.md`가 이 필드로 판정한다):
    - `transcript_interim`, `transcript_final`에 그 작업에 적용된 상한 `token_cap`
